@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Generated files
+src/cli/commands/index.ts
+src/plugins/internal-registry.ts
+
+# Environment
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Test coverage
+coverage/
+
+# Genie workspace
+.genie/
+
+# Local scratch
+.tmp/
+
+# Codex/Electron runtime bundles accidentally dropped in repo root
+/app-session-*.js
+/app-session-*.js.map
+
+# Local Claude Code config
+.claude/

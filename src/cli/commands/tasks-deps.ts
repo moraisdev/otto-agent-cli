@@ -1,0 +1,186 @@
+import "reflect-metadata";
+import { Arg, Command, Group, Option } from "../decorators.js";
+import { fail } from "../context.js";
+import { buildCliOffsetPagination, paginateCliItems } from "../pagination.js";
+import {
+  addTaskDependency,
+  emitTaskEvent,
+  getTaskDependencySurface,
+  getTaskDetails,
+  removeTaskDependency,
+} from "../../tasks/index.js";
+
+function formatTime(ts?: number): string {
+  if (!ts) return "-";
+  return new Date(ts).toLocaleString("pt-BR", {
+    timeZone: "America/Sao_Paulo",
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function formatStatus(status: string): string {
+  switch (status) {
+    case "waiting":
+      return "waiting";
+    case "dispatched":
+      return "queued";
+    case "in_progress":
+      return "working";
+    default:
+      return status;
+  }
+}
+
+async function emitMutation(result: {
+  task: { id: string };
+  event: { type: string };
+  relatedEvents?: Array<{ task: { id: string }; event: { type: string } }>;
+  wasNoop?: boolean;
+}) {
+  if (result.wasNoop) {
+    return;
+  }
+  await emitTaskEvent(result.task as never, result.event as never);
+  for (const related of result.relatedEvents ?? []) {
+    await emitTaskEvent(related.task as never, related.event as never);
+  }
+}
+
+@Group({
+  name: "tasks.deps",
+  description: "Inspect and mutate task dependency gating",
+  scope: "open",
+})
+export class TaskDependencyCommands {
+  @Command({ name: "add", description: "Add one gating dependency to a task" })
+  async add(
+    @Arg("taskId", { description: "Downstream task id" }) taskId: string,
+    @Arg("dependencyTaskId", { description: "Upstream task id that must reach done" }) dependencyTaskId: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    const result = await addTaskDependency(taskId, dependencyTaskId);
+    await emitMutation(result);
+
+    if (asJson) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      const verb = result.wasNoop ? "already present" : "added";
+      console.log(`\n✓ Dependency ${verb}: ${taskId} -> ${dependencyTaskId}`);
+      console.log(`  Readiness: ${result.readiness.label}`);
+      if (result.readiness.hasLaunchPlan) {
+        console.log("  Launch plan remains armed; task will auto-dispatch when ready.");
+      }
+    }
+    return result;
+  }
+
+  @Command({ name: "rm", description: "Remove one gating dependency from a task", aliases: ["remove"] })
+  async rm(
+    @Arg("taskId", { description: "Downstream task id" }) taskId: string,
+    @Arg("dependencyTaskId", { description: "Upstream task id to remove from gating" }) dependencyTaskId: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    const result = await removeTaskDependency(taskId, dependencyTaskId);
+    await emitMutation(result);
+
+    if (asJson) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      const verb = result.wasNoop ? "already absent" : "removed";
+      console.log(`\n✓ Dependency ${verb}: ${taskId} -> ${dependencyTaskId}`);
+      console.log(`  Readiness: ${result.readiness.label}`);
+      if (result.readiness.hasLaunchPlan) {
+        console.log("  Launch plan remains armed.");
+      }
+    }
+    return result;
+  }
+
+  @Command({ name: "ls", description: "List gating dependencies and dependents for a task", aliases: ["list"] })
+  ls(
+    @Arg("taskId", { description: "Task id to inspect" }) taskId: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+    @Option({ flags: "--limit <n>", description: "Page size (default: 50, max: 500)" }) limit?: string,
+    @Option({ flags: "--offset <n>", description: "Number of matching dependency edges to skip (default: 0)" })
+    offset?: string,
+  ) {
+    const details = getTaskDetails(taskId);
+    if (!details.task) {
+      fail(`Task not found: ${taskId}`);
+    }
+
+    const dependencySurface = getTaskDependencySurface(details.task, details.activeAssignment);
+    const edges = [
+      ...dependencySurface.dependencies.map((dependency) => ({ ...dependency, direction: "dependency" as const })),
+      ...dependencySurface.dependents.map((dependent) => ({ ...dependent, direction: "dependent" as const })),
+    ];
+    const page = paginateCliItems(edges, { limit, offset });
+    const dependencies = page.items.filter((edge) => edge.direction === "dependency");
+    const dependents = page.items.filter((edge) => edge.direction === "dependent");
+    const pagination = buildCliOffsetPagination({
+      baseCommand: ["otto", "tasks", "deps", "ls", taskId],
+      limit: page.limit,
+      offset: page.offset,
+      returned: page.items.length,
+      total: page.total,
+    });
+    const payload = {
+      taskId,
+      total: page.total,
+      pagination,
+      readiness: dependencySurface.readiness,
+      launchPlan: dependencySurface.launchPlan,
+      items: page.items,
+      dependencies,
+      dependents,
+    };
+    if (asJson) {
+      console.log(JSON.stringify(payload, null, 2));
+    } else {
+      console.log(`\nTask deps:   ${taskId}`);
+      console.log(`Readiness:   ${dependencySurface.readiness.label}`);
+      console.log(
+        `Launch plan: ${dependencySurface.launchPlan ? `${dependencySurface.launchPlan.agentId}/${dependencySurface.launchPlan.sessionName}` : "-"}`,
+      );
+
+      console.log("\nDependencies:");
+      if (dependencies.length === 0) {
+        console.log("  - none");
+      } else {
+        for (const dependency of dependencies) {
+          const satisfaction = dependency.satisfied ? `done @ ${formatTime(dependency.satisfiedAt)}` : "pending";
+          console.log(
+            `  - ${dependency.relatedTaskId} :: ${formatStatus(dependency.relatedTaskStatus)} :: ${dependency.relatedTaskProgress}% :: ${satisfaction} :: ${dependency.relatedTaskTitle}`,
+          );
+        }
+      }
+
+      console.log("\nDependents:");
+      if (dependents.length === 0) {
+        console.log("  - none");
+      } else {
+        for (const dependent of dependents) {
+          const satisfaction = dependent.satisfied ? `done @ ${formatTime(dependent.satisfiedAt)}` : "pending";
+          console.log(
+            `  - ${dependent.relatedTaskId} :: ${formatStatus(dependent.relatedTaskStatus)} :: ${dependent.relatedTaskProgress}% :: ${satisfaction} :: ${dependent.relatedTaskTitle}`,
+          );
+        }
+      }
+
+      if (pagination.nextCommand) {
+        console.log("\nNext page:");
+        console.log(`  ${pagination.nextCommand}`);
+      }
+
+      if (dependencySurface.dependencies.length === 0 && dependencySurface.dependents.length === 0) {
+        console.log("\nExamples:");
+        console.log(`  otto tasks deps add ${taskId} <upstream-task>`);
+        console.log(`  otto tasks create "Blocked work" --instructions "..." --depends-on ${taskId}`);
+      }
+    }
+    return payload;
+  }
+}

@@ -1,0 +1,348 @@
+---
+title: Contacts
+description: Managing contacts, identities, tags, approval workflows, and agent scoping.
+---
+
+## Overview
+
+Contacts are the core identity layer in Otto. Every person or group that interacts with your agents is tracked as a contact, with one or more identities (phone numbers, WhatsApp LIDs, Telegram IDs, etc.) linked to a single record. Contacts control who can message your agents, how messages are routed, and what level of access each person has.
+
+## Contact Lifecycle
+
+Every contact follows a status lifecycle:
+
+| Status | Description |
+|---|---|
+| `discovered` | Seen in a group or mentioned, but never messaged directly. Created automatically when Otto encounters unknown participants. |
+| `pending` | Sent a message but hasn't been approved yet. Awaiting manual approval. |
+| `allowed` | Approved to interact with agents normally. |
+| `blocked` | Blocked. All messages from this contact are silently ignored. |
+
+The typical flow is:
+
+```
+discovered -> pending -> allowed
+                      -> blocked
+```
+
+- **Discovered contacts** are created automatically when Otto encounters group members it hasn't seen before. They have `source: "discovered"`.
+- **Pending contacts** are created when someone sends a message and Otto doesn't have them as allowed. They have `source: "inbound"`.
+- **Manually added contacts** skip directly to `allowed` with `source: "manual"`.
+
+## Multi-Identity System
+
+A single contact can have multiple identities across platforms. This allows Otto to recognize the same person whether they message from a phone number, a WhatsApp LID, or a group.
+
+### Supported Platforms
+
+| Platform | Format | Example |
+|---|---|---|
+| `phone` | International number | `5511999999999` |
+| `whatsapp_lid` | WhatsApp Linked ID | `lid:12345678901234` |
+| `whatsapp_group` | WhatsApp Group | `group:120363425628305127` |
+| `telegram` | Telegram user ID | *(platform-specific)* |
+| `matrix` | Matrix user ID | *(platform-specific)* |
+
+### Managing Identities
+
+Add an identity to link a new platform to an existing contact:
+
+```bash
+# Link a WhatsApp LID to an existing phone contact
+otto contacts identity-add 5511999999999 whatsapp_lid "lid:12345678901234"
+
+# Link a group identity
+otto contacts identity-add 5511999999999 whatsapp_group "group:120363425628305127"
+```
+
+Remove an identity:
+
+```bash
+otto contacts identity-remove whatsapp_lid "lid:12345678901234"
+```
+
+### Auto-Linking
+
+When Otto detects that a phone number and a WhatsApp LID belong to the same person (e.g., from message metadata), it automatically links them. If both exist as separate contacts, Otto merges them -- keeping the contact with the higher-priority status (`allowed` > `pending` > `discovered` > `blocked`).
+
+### Viewing Identities
+
+Use `info` to see all identities for a contact:
+
+```bash
+otto contacts info 5511999999999
+```
+
+Output includes all linked identities with their platform and primary marker.
+
+## Contact Properties
+
+Each contact has the following fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | Auto-generated 12-character UUID |
+| `name` | string | Contact name |
+| `email` | string | Email address |
+| `status` | enum | `allowed`, `pending`, `blocked`, `discovered` |
+| `reply_mode` | enum | `auto` or `mention` |
+| `tags` | string[] | Array of arbitrary tags |
+| `notes` | object | Free-form JSON metadata |
+| `opt_out` | boolean | Whether the contact has opted out |
+| `source` | enum | `inbound`, `outbound`, `manual`, `discovered` |
+| `allowed_agents` | string[] | Restrict which agents can interact (null = all) |
+| `interaction_count` | number | Total message count (inbound + outbound) |
+| `last_inbound_at` | datetime | Timestamp of last received message |
+| `last_outbound_at` | datetime | Timestamp of last sent message |
+
+### Setting Properties
+
+```bash
+otto contacts set 5511999999999 name "Joao Silva"
+otto contacts set 5511999999999 email "joao@example.com"
+otto contacts set 5511999999999 mode mention
+otto contacts set 5511999999999 tags '["lead","vip"]'
+otto contacts set 5511999999999 notes '{"empresa":"TechCorp","cargo":"CTO"}'
+otto contacts set 5511999999999 opt-out true
+otto contacts set 5511999999999 source outbound
+otto contacts set 5511999999999 allowed-agents '["main","vendas"]'
+```
+
+Use `-` to clear a field:
+
+```bash
+otto contacts set 5511999999999 email -
+otto contacts set 5511999999999 allowed-agents -
+```
+
+## Reply Modes
+
+Each contact has a reply mode that controls when the agent responds:
+
+| Mode | Behavior |
+|---|---|
+| `auto` | Agent responds to every message from this contact (default) |
+| `mention` | Agent only responds when explicitly mentioned in the message |
+
+This is particularly useful for groups where you don't want the agent to respond to every message:
+
+```bash
+# Set a contact to mention-only
+otto contacts set 5511999999999 mode mention
+
+# Or set it during approval
+otto contacts approve abc123def456 mention
+```
+
+## Approval Workflow
+
+When a new contact messages your bot and is not yet registered, Otto creates them as `pending`. You can review and approve pending contacts:
+
+### List Pending Contacts
+
+```bash
+otto contacts pending
+```
+
+This shows two sections:
+- **Global pending**: Contacts awaiting approval across all accounts
+- **Account pending**: Contacts that messaged a specific account but no route matched
+
+### Approve a Contact
+
+```bash
+# Simple approval
+otto contacts approve abc123def456
+
+# Approve with mention-only mode
+otto contacts approve abc123def456 mention
+
+# Approve and restrict to specific agents
+otto contacts approve abc123def456 --agent main,vendas
+```
+
+### Block a Contact
+
+```bash
+otto contacts block abc123def456
+```
+
+### Allow a Previously Blocked Contact
+
+```bash
+otto contacts allow abc123def456
+```
+
+## Tags and Search
+
+Tags are arbitrary string labels attached to contacts. They are used for filtering, grouping, and REBAC-based contact scoping.
+
+### Adding and Removing Tags
+
+```bash
+# Add a tag
+otto contacts tag 5511999999999 lead
+otto contacts tag 5511999999999 vip
+
+# Remove a tag
+otto contacts untag 5511999999999 lead
+
+# Set all tags at once (replaces existing)
+otto contacts set 5511999999999 tags '["lead","vip","enterprise"]'
+```
+
+### Group-Specific Tags
+
+You can assign per-group tags to a contact. This lets you label someone differently in each group they belong to (e.g., "manager" in one group, "observer" in another):
+
+```bash
+# Set a tag for a contact within a specific group
+otto contacts group-tag 5511999999999 group:120363425628305127 manager
+
+# Remove a group-specific tag
+otto contacts group-untag 5511999999999 group:120363425628305127
+```
+
+Group tags are stored in the contact's `notes.groupTags` object.
+
+### Searching
+
+```bash
+# Search by tag
+otto contacts find lead --tag
+
+# Search by name, email, or identity
+otto contacts find "Joao"
+otto contacts find "techcorp"
+```
+
+## Agent Assignment and Contact Scoping
+
+### Restricting Contacts to Agents
+
+Use `allowed_agents` to restrict which agents can interact with a contact. When set, only the listed agents will receive messages from that contact:
+
+```bash
+# Restrict to specific agents
+otto contacts set 5511999999999 allowed-agents '["vendas","suporte"]'
+
+# Remove restriction (all agents can interact)
+otto contacts set 5511999999999 allowed-agents -
+```
+
+### Contact Scoping via REBAC
+
+Agents have scoped visibility into the contacts database, controlled by REBAC permissions:
+
+| Permission | Effect |
+|---|---|
+| `write_contacts` | Full read/write access to all contacts |
+| `read_own_contacts` | Can see contacts routed to this agent's sessions |
+| `read_tagged_contacts` | Can see contacts with a specific tag |
+| `read_contact` | Can see a specific contact by ID |
+
+Configure with:
+
+```bash
+# Agent can see all contacts routed to it
+otto permissions grant agent:vendas read_own_contacts system:*
+
+# Agent can see contacts tagged "lead"
+otto permissions grant agent:vendas read_tagged_contacts system:lead
+
+# Agent can see a specific contact
+otto permissions grant agent:vendas read_contact contact:abc123def456
+```
+
+### Routing Priority
+
+When a message arrives, the agent is resolved in this order:
+
+1. `contact.allowed_agents` -- if set, only these agents receive the message
+2. Route match via `otto instances routes` -- pattern-based routing
+3. Account-agent mapping -- from `otto whatsapp connect --agent`
+4. Default agent -- fallback
+
+## Merging Duplicate Contacts
+
+When the same person exists as two separate contacts (e.g., one created from a phone number and another from a WhatsApp LID), you can merge them:
+
+```bash
+otto contacts merge <source-id> <target-id>
+```
+
+This operation:
+- Moves all identities from the source contact to the target
+- Fills in blank fields on the target (name, email) from the source
+- Merges tags and notes if the target has none
+- Sums interaction counts
+- Deletes the source contact
+
+The target contact is preserved; the source contact is removed.
+
+## CLI Reference
+
+### Core Commands
+
+```bash
+# List all contacts
+otto contacts list
+otto contacts list --status pending
+
+# Add a contact (immediately allowed)
+otto contacts add 5511999999999 "Joao Silva"
+otto contacts add 5511999999999 "Joao" --agent main,vendas
+
+# View contact details
+otto contacts info 5511999999999
+otto contacts check 5511999999999   # alias for info
+
+# Remove a contact entirely
+otto contacts remove abc123def456
+```
+
+### Status Management
+
+```bash
+otto contacts approve abc123def456
+otto contacts approve abc123def456 mention --agent vendas
+otto contacts allow abc123def456
+otto contacts block abc123def456
+```
+
+### Tags
+
+```bash
+otto contacts tag 5511999999999 lead
+otto contacts untag 5511999999999 lead
+otto contacts group-tag 5511999999999 group:120363 manager
+otto contacts group-untag 5511999999999 group:120363
+```
+
+### Search
+
+```bash
+otto contacts find "Joao"
+otto contacts find lead --tag
+```
+
+### Identity Management
+
+```bash
+otto contacts identity-add abc123 whatsapp_lid "lid:12345"
+otto contacts identity-remove whatsapp_lid "lid:12345"
+otto contacts merge <source-id> <target-id>
+```
+
+### Properties
+
+```bash
+otto contacts set 5511999999999 name "New Name"
+otto contacts set 5511999999999 email "new@email.com"
+otto contacts set 5511999999999 mode mention
+otto contacts set 5511999999999 tags '["tag1","tag2"]'
+otto contacts set 5511999999999 notes '{"key":"value"}'
+otto contacts set 5511999999999 opt-out true
+otto contacts set 5511999999999 source manual
+otto contacts set 5511999999999 allowed-agents '["main"]'
+```

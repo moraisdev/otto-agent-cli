@@ -1,0 +1,100 @@
+#!/usr/bin/env bun
+
+/**
+ * Sync Otto package version to the date-based release format.
+ *
+ * Format: <prefix>.YYMMDD.N
+ * Example: 3.260418.2
+ */
+
+import { execSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+
+type PackageJson = {
+  name?: string;
+  version?: string;
+  [key: string]: unknown;
+};
+
+function repoRoot(): string {
+  return join(dirname(import.meta.path), "..");
+}
+
+function resolvePackagePath(root: string): string {
+  const override = process.env.OTTO_PACKAGE_PATH?.trim();
+  if (!override) return join(root, "package.json");
+  return override.startsWith("/") ? override : join(root, override);
+}
+
+function todayUtc(): string {
+  const now = new Date();
+  const yy = String(now.getUTCFullYear()).slice(-2);
+  const mm = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(now.getUTCDate()).padStart(2, "0");
+  return `${yy}${mm}${dd}`;
+}
+
+function readCurrentPackage(root: string): PackageJson {
+  return JSON.parse(readFileSync(resolvePackagePath(root), "utf8")) as PackageJson;
+}
+
+function resolvePrefix(pkg: PackageJson): string {
+  const explicit = process.env.OTTO_VERSION_PREFIX?.trim();
+  if (explicit) return explicit;
+
+  const current = pkg.version ?? "3.0.0";
+  const [major] = current.split(".");
+  return /^\d+$/.test(major) ? major : "3";
+}
+
+function countTagsForToday(prefix: string, datePrefix: string): number {
+  try {
+    const output = execSync(`git tag --list "v${prefix}.${datePrefix}.*"`, {
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    return output.trim().split("\n").filter(Boolean).length;
+  } catch {
+    return 0;
+  }
+}
+
+function resolveBuildNumber(prefix: string, datePrefix: string): number {
+  const explicit = process.env.OTTO_BUILD_NUMBER?.trim();
+  if (explicit) {
+    const parsed = Number.parseInt(explicit, 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    throw new Error(`Invalid OTTO_BUILD_NUMBER: ${explicit}`);
+  }
+
+  return countTagsForToday(prefix, datePrefix) + 1;
+}
+
+async function updatePackageVersion(packagePath: string, version: string): Promise<void> {
+  if (!existsSync(packagePath)) throw new Error(`package.json not found: ${packagePath}`);
+
+  const pkg = JSON.parse(await readFile(packagePath, "utf8")) as PackageJson;
+  pkg.version = version;
+  await writeFile(packagePath, `${JSON.stringify(pkg, null, 2)}\n`);
+}
+
+async function main(): Promise<void> {
+  const root = repoRoot();
+  const packagePath = resolvePackagePath(root);
+  const pkg = readCurrentPackage(root);
+  const prefix = resolvePrefix(pkg);
+  const datePrefix = todayUtc();
+  const buildNumber = resolveBuildNumber(prefix, datePrefix);
+  const version = process.env.OTTO_VERSION?.trim() || `${prefix}.${datePrefix}.${buildNumber}`;
+
+  await updatePackageVersion(packagePath, version);
+  console.log(`Otto version: ${version}`);
+  console.log(`Updated ${packagePath}`);
+}
+
+main().catch((error) => {
+  console.error(`Version sync failed: ${error instanceof Error ? error.message : error}`);
+  process.exit(1);
+});

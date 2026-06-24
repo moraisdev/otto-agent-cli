@@ -1,0 +1,51 @@
+{
+  "manifest_version": 3,
+  "name": "Otto WhatsApp Overlay",
+  "version": "0.1.0",
+  "description": "Sobrepoe estado operacional do Otto no WhatsApp Web.",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://web.whatsapp.com/*"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://web.whatsapp.com/*"
+      ],
+      "js": [
+        "task-duration.js",
+        "task-presenter.js",
+        "task-drawer-state.js",
+        "content.js"
+      ],
+      "css": [
+        "styles.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "page-bridge.js"
+      ],
+      "matches": [
+        "https://web.whatsapp.com/*"
+      ]
+    }
+  ],
+  "action": {
+    "default_title": "Otto WhatsApp Overlay"
+  }
+}

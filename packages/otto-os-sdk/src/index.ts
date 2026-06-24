@@ -1,0 +1,52 @@
+/**
+ * Public entry point for `@otto-os/sdk`.
+ *
+ * The SDK is split into stable hand-written modules (`errors`, transports)
+ * and four GENERATED files (`client`, `schemas`, `types`, `version`). Both are
+ * re-exported here so consumers who just `import { OttoClient } from "@otto-os/sdk"`
+ * get a typed client out of the box.
+ *
+ * For tree-shaking and browser/edge compatibility, prefer the deep imports:
+ *
+ *   import { OttoClient } from "@otto-os/sdk/client";
+ *   import { createHttpTransport } from "@otto-os/sdk/transport/http";
+ */
+
+export { OttoClient } from "./client.js";
+export {
+  createHttpTransport,
+  type HttpTransportConfig,
+} from "./transport/http.js";
+export {
+  OttoStreamClient,
+  createStreamClient,
+  parseSse,
+  type AuditStreamOptions,
+  type ChatStreamOptions,
+  type ChatStreamPayload,
+  type EventsStreamOptions,
+  type GatewayTopicEvent,
+  type InstanceStreamOptions,
+  type InstanceStreamPayload,
+  type OttoSseEvent,
+  type SessionStreamOptions,
+  type SessionStreamPayload,
+  type StreamClientConfig,
+  type TaskStreamPayload,
+  type TasksStreamOptions,
+} from "./streaming.js";
+export type { Transport, TransportCallInput } from "./transport/types.js";
+export {
+  OttoError,
+  OttoAuthError,
+  OttoPermissionError,
+  OttoValidationError,
+  OttoInternalError,
+  OttoTransportError,
+  type AuthFailureReason,
+  type OttoIssue,
+  type OttoErrorBody,
+} from "./errors.js";
+export { SDK_VERSION, REGISTRY_HASH, GIT_SHA } from "./version.js";
+export * from "./types.js";
+export * from "./schemas.js";

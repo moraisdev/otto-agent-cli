@@ -1,0 +1,162 @@
+---
+title: NATS Event Bus
+description: Complete reference for all NATS topics, payloads, and event flow in Otto.
+---
+
+NATS is Otto's central pub/sub backbone. All messages, prompts, tool calls, and responses flow through it as events on hierarchical topics.
+
+## Concepts
+
+- **Topic/Subject** — Hierarchical namespace separated by `.` (e.g., `otto.session.main.prompt`)
+- **Event** — JSON payload published to a subject
+- **Wildcards** — `*` matches one level, `>` matches multiple levels
+- **Connection** — Direct TCP to `nats://127.0.0.1:4222` (no HTTP/WebSocket intermediary)
+
+## Session Events
+
+Events scoped to a session name (e.g., `agent-main-abc123`).
+
+| Topic | Payload |
+|-------|---------|
+| `otto.session.{name}.prompt` | `{ prompt, source?, context?, _agentId? }` |
+| `otto.session.{name}.response` | `{ response, target?, _emitId, _instanceId, _pid, _v: 2 }` |
+| `otto.session.{name}.claude` | Raw Claude SDK event: `{ type: "system"/"assistant"/"result"/"silent"/... }` |
+| `otto.session.{name}.tool` | Start: `{ event: "start", toolId, toolName, safety, input, timestamp, sessionName, agentId }` |
+| `otto.session.{name}.tool` | End: `{ event: "end", toolId, toolName, output, isError, durationMs, timestamp, sessionName, agentId }` |
+| `otto.session.{name}.stream` | `{ chunk }` — text delta streaming for TUI |
+| `otto.session.abort` | `{ sessionKey?, sessionName? }` — abort ephemeral session |
+
+The prompt topic goes via JetStream WorkQueue stream (`SESSION_PROMPTS`). All others are plain NATS pub/sub.
+
+## Inbound Events (Channels to Bot)
+
+| Topic | Payload |
+|-------|---------|
+| `otto.inbound.reaction` | `{ targetMessageId, emoji, senderId }` |
+| `otto.inbound.reply` | `{ targetMessageId, text, senderId }` |
+| `otto.inbound.pollVote` | `{ pollMessageId, votes: [{ name, voters[] }] }` |
+
+Channel messages arrive via omni JetStream on `message.received.{channelType}.{instanceId}`, not via otto pub/sub. The OmniConsumer translates these into session prompts.
+
+## Delivery Events (Bot to Gateway)
+
+| Topic | Payload |
+|-------|---------|
+| `otto.outbound.deliver` | `{ channel, accountId, to, text?, poll?, typingDelayMs?, pauseMs?, replyTopic? }` |
+| `otto.outbound.reaction` | `{ channel, accountId, chatId, messageId, emoji }` |
+| `otto.outbound.receipt` | `{ channel, accountId, chatId, senderId, messageIds[] }` |
+
+## Media Events
+
+| Topic | Payload |
+|-------|---------|
+| `otto.media.send` | `{ channel, accountId, chatId, filePath, mimetype, type, filename, caption?, voiceNote? }` |
+
+Type values: `image`, `video`, `audio`, `document`.
+
+## Contact and Approval Events
+
+| Topic | Payload |
+|-------|---------|
+| `otto.contacts.pending` | `{ type: "account", channel, accountId, senderId, chatId, isGroup }` |
+| `otto.approval.request` | `{ type: "plan"/"spec"/"question", sessionName, agentId, delegated, channel, chatId, timestamp }` |
+| `otto.approval.response` | `{ type: "plan"/"spec"/"question", sessionName, agentId, approved, reason?, answers? }` |
+
+## Instance Events
+
+| Topic | Payload |
+|-------|---------|
+| `otto.instances.unregistered` | `{ instanceId, channelType, subject, from, chatId, isGroup, contentType, timestamp }` |
+| `otto.whatsapp.qr.{instanceId}` | `{ type: "qr", instanceId, qr, channelType }` |
+| `otto.whatsapp.connected.{instanceId}` | `{ type: "connected", instanceId, channelType, profileName, ownerIdentifier }` |
+| `otto.whatsapp.group.{op}` | `{ accountId, replyTopic, ... }` — ops: list, info, create, leave, add, remove, join |
+
+## Audit Events
+
+| Topic | Payload |
+|-------|---------|
+| `otto.audit.denied` | `{ type: "env_spoofing"/"executable"/"session_scope"/"tool"/"group", agentId, denied, reason, detail? }` |
+
+## System and Config Events
+
+| Topic | Payload |
+|-------|---------|
+| `otto.config.changed` | `{}` — config changed via CLI |
+| `otto.triggers.refresh` | `{}` — trigger subscription refresh |
+| `otto.triggers.test` | `{ triggerId }` — manual trigger test |
+| `otto.cron.refresh` | `{}` — cron timer refresh |
+| `otto.cron.trigger` | `{ jobId }` — manual cron trigger |
+| `otto.heartbeat.refresh` | `{}` — heartbeat timer refresh |
+| `otto.copilot.watch` | `{ team, agentId }` — copilot inbox watcher |
+
+## CLI Tool Events
+
+When agents execute CLI tools, events are emitted:
+
+```
+otto.{sessionKey}.cli.{group}.{command}
+```
+
+Example: `otto.agent:main:main.cli.contacts.add`
+
+## Copilot Events (Claude Code Bridge)
+
+Events from Claude Code sessions, published by the hook script:
+
+| Topic | CC Event | Description |
+|-------|----------|-------------|
+| `otto.copilot.session.start` | SessionStart | CC session opened |
+| `otto.copilot.session.end` | SessionEnd | CC session closed |
+| `otto.copilot.prompt` | UserPromptSubmit | User sent prompt |
+| `otto.copilot.tool.pre` | PreToolUse | Tool about to execute |
+| `otto.copilot.tool.post` | PostToolUse | Tool executed |
+| `otto.copilot.tool.fail` | PostToolUseFailure | Tool failed |
+| `otto.copilot.stop` | Stop | Claude finished generating |
+| `otto.copilot.subagent.start` | SubagentStart | Subagent created |
+| `otto.copilot.subagent.stop` | SubagentStop | Subagent finished |
+| `otto.copilot.notification` | Notification | CC notification |
+| `otto.copilot.teammate.idle` | TeammateIdle | Teammate went idle |
+| `otto.copilot.config.change` | ConfigChange | CC config changed |
+| `otto.copilot.compact.pre` | PreCompact | Context compaction |
+| `otto.copilot.task.completed` | TaskCompleted | Delegated task completed |
+
+### Copilot Payload Envelope
+
+```json
+{
+  "session_id": "abc-123",
+  "session_type": "main",
+  "cwd": "/path/to/project",
+  "event": "PostToolUse",
+  "timestamp": "2026-02-25T17:30:00Z",
+  "data": { }
+}
+```
+
+## JetStream Streams
+
+| Stream | Consumer | Filter | Source |
+|--------|----------|--------|--------|
+| `MESSAGE` | `otto-messages` | `message.received.>` | omni (channel inbound) |
+| `INSTANCE` | `otto-instances` | `instance.>` | omni (connection events) |
+| `REACTION` | `otto-reactions` | `reaction.received.>` | omni (emoji reactions) |
+| `SESSION_PROMPTS` | `otto-prompts` | `otto.session.*.prompt` | otto (internal routing) |
+
+## Programmatic API
+
+```typescript
+import { nats } from "./nats.js";
+
+// Publish event
+await nats.emit("otto.session.main.prompt", { prompt: "oi" });
+
+// Subscribe (wildcards)
+for await (const event of nats.subscribe("otto.session.*.prompt")) {
+  console.log(event.topic, event.data);
+}
+
+// Multiple topics
+for await (const event of nats.subscribe("otto.session.*.response", "otto.session.*.tool")) {
+  console.log(event.topic, event.data);
+}
+```

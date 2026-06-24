@@ -1,0 +1,473 @@
+/**
+ * Otto Daemon
+ *
+ * Connects to external NATS and omni services (managed by PM2/omni CLI).
+ * No child process spawning — all infrastructure is external.
+ */
+
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import { OttoBot } from "./bot.js";
+import { createGateway } from "./gateway.js";
+import { OmniSender, OmniConsumer } from "./omni/index.js";
+import { createOmniClient } from "./omni/client.js";
+import { loadConfig } from "./utils/config.js";
+import { connectNats, closeNats, subscribe, publish } from "./nats.js";
+import { configStore } from "./config-store.js";
+import { logger } from "./utils/logger.js";
+import { closeAllOttoDbs } from "./db/close-all.js";
+import { startHeartbeatRunner, stopHeartbeatRunner } from "./heartbeat/index.js";
+import { startCronRunner, stopCronRunner } from "./cron/index.js";
+import { startTriggerRunner, stopTriggerRunner } from "./triggers/index.js";
+import { startEphemeralRunner, stopEphemeralRunner } from "./ephemeral/index.js";
+import { startHookRunner, stopHookRunner } from "./hooks-runtime/index.js";
+import { startTaskCheckpointRunner, stopTaskCheckpointRunner } from "./tasks/index.js";
+import { createSessionAdapterBus } from "./adapters/index.js";
+import { syncRelationsFromConfig } from "./permissions/relations.js";
+import { resolveOmniConnection } from "./omni-config.js";
+import { ensureSessionPromptsStream } from "./omni/session-stream.js";
+import { ensureOttoEventsStream } from "./events/audit-stream.js";
+import { startWebhookHttpServerFromEnv, type WebhookHttpServerHandle } from "./webhooks/http-server.js";
+import { hasLiveAdminContext } from "./runtime/context-registry.js";
+import {
+  tryAcquireLeadership,
+  startLeadershipRenewal,
+  watchForLeadershipVacancy,
+  releaseLeadership,
+} from "./leader/index.js";
+
+const log = logger.child("daemon");
+
+// Load environment from ~/.otto/.env
+function loadEnvFile() {
+  const envFile = join(homedir(), ".otto", ".env");
+  if (!existsSync(envFile)) {
+    return;
+  }
+
+  const content = readFileSync(envFile, "utf-8");
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+
+    const eqIndex = trimmed.indexOf("=");
+    if (eqIndex === -1) continue;
+
+    const key = trimmed.slice(0, eqIndex).trim();
+    let value = trimmed.slice(eqIndex + 1).trim();
+
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+
+    process.env[key] = value;
+  }
+
+  log.info("Loaded environment from ~/.otto/.env");
+}
+
+loadEnvFile();
+
+const RESTART_REASON_FILE = join(homedir(), ".otto", "restart-reason.txt");
+
+// Handle signals
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+// Handle uncaught errors
+process.on("uncaughtException", (err) => {
+  log.error("Uncaught exception", err);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  const stack = reason instanceof Error ? reason.stack : undefined;
+  log.error("Unhandled rejection", { reason, stack, promise });
+});
+
+let bot: OttoBot | null = null;
+let gateway: ReturnType<typeof createGateway> | null = null;
+let sessionAdapterBus: ReturnType<typeof createSessionAdapterBus> | null = null;
+let shuttingDown = false;
+let omniConsumer: OmniConsumer | null = null;
+let webhookHttpServer: WebhookHttpServerHandle | null = null;
+
+/** Get the bot instance (for in-process access like /reset) */
+export function getBotInstance(): OttoBot | null {
+  return bot;
+}
+
+async function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  log.info(`Received ${signal}, shutting down...`, { pid: process.pid });
+
+  // Global shutdown guard — force exit if graceful shutdown hangs
+  const shutdownTimeout = setTimeout(() => {
+    log.error("Shutdown timeout — forcing exit");
+    process.exit(1);
+  }, 15_000);
+
+  try {
+    // Stop bot FIRST to abort SDK subprocesses
+    if (bot) {
+      log.info("Stopping bot (aborting SDK subprocesses)...");
+      await bot.stop();
+      log.info("Bot stopped");
+    }
+
+    // Stop runners and release leadership so another daemon can take over
+    await stopEphemeralRunner();
+    await stopHookRunner();
+    await stopTriggerRunner();
+    await stopHeartbeatRunner();
+    await stopCronRunner();
+    await stopTaskCheckpointRunner();
+    await releaseLeadership("runners");
+
+    // Stop gateway
+    if (gateway) {
+      await gateway.stop();
+    }
+
+    if (sessionAdapterBus) {
+      await sessionAdapterBus.stop();
+    }
+
+    if (webhookHttpServer) {
+      await webhookHttpServer.stop();
+    }
+
+    // Stop omni consumer
+    if (omniConsumer) {
+      await omniConsumer.stop();
+    }
+
+    // Stop config store refresh
+    configStore.stop();
+
+    // Close NATS connection
+    await closeNats();
+
+    // Close all SQLite handles AFTER bot/runners/gateway/omni have shut down,
+    // so writes-in-flight have settled. Best-effort: failures are logged but
+    // never block the shutdown sequence.
+    closeAllOttoDbs();
+  } catch (err) {
+    log.error("Error during shutdown", err);
+  }
+
+  clearTimeout(shutdownTimeout);
+  log.info("Daemon stopped", { pid: process.pid });
+  process.exit(0);
+}
+
+export async function startDaemon() {
+  // Step 1: Connect to NATS (with retry for PM2 parallel startup)
+  const natsUrl = process.env.NATS_URL || "nats://127.0.0.1:4222";
+  log.info("Connecting to NATS...", { natsUrl });
+  await connectNats(natsUrl, { explicit: true });
+
+  const config = loadConfig();
+  logger.setLevel(config.logLevel);
+
+  log.info("Starting Otto daemon...");
+
+  // Step 2: Start config store (NATS sub + periodic refresh)
+  await configStore.startRefresh();
+
+  // Step 3: Resolve omni connection
+  let omniApiUrl: string | undefined;
+  let omniApiKey: string | undefined;
+
+  const omniConn = resolveOmniConnection();
+  if (omniConn) {
+    omniApiUrl = omniConn.apiUrl;
+    omniApiKey = omniConn.apiKey;
+    log.info("Omni connection resolved", { apiUrl: omniApiUrl, source: omniConn.source });
+  } else {
+    log.warn("Omni not configured — no channel support (install omni: bun add -g @automagik/omni)");
+  }
+
+  // Step 4: Ensure SESSION_PROMPTS JetStream stream exists
+  // This stream replaces NATS core pub/sub for session routing,
+  // enabling work queue semantics — each prompt delivered to exactly one daemon.
+  log.info("Ensuring SESSION_PROMPTS JetStream stream...");
+  await ensureSessionPromptsStream();
+  log.info("SESSION_PROMPTS stream ready");
+  log.info("Ensuring OTTO_EVENTS JetStream stream...");
+  await ensureOttoEventsStream();
+  log.info("OTTO_EVENTS stream ready");
+
+  // Step 5: Sync REBAC relations from agent configs
+  syncRelationsFromConfig();
+
+  // Step 6: Start bot
+  bot = new OttoBot({ config });
+  await bot.start();
+  log.info("Bot started");
+
+  // Step 6: Set up omni sender + consumer + gateway
+  if (omniApiUrl && omniApiKey) {
+    const sender = new OmniSender(omniApiUrl, omniApiKey);
+    omniConsumer = new OmniConsumer(sender, omniApiUrl, omniApiKey, {
+      isRuntimeSessionActive: (sessionName) => bot?.isRuntimeSessionActive(sessionName) ?? false,
+      abortRuntimeSession: (sessionName, provenance) => bot?.abortSession(sessionName, provenance) ?? false,
+    });
+
+    try {
+      await omniConsumer.start();
+      log.info("Omni consumer started");
+    } catch (err) {
+      log.error("Failed to start omni consumer", err);
+    }
+
+    // Deterministic remote-channel connect: a client (the TUI) publishes a
+    // connect request for a channel; we call omni connect here — NO LLM. QR /
+    // connected events flow back via the omni consumer's re-emit
+    // (otto.channel.qr.* / otto.channel.connected.*). The TUI also lists the
+    // available channels via otto.channels.list.request. Best-effort; failures
+    // are reported and never crash the daemon.
+    const normalizeChannel = (c?: string): string => {
+      const lower = (c ?? "").toLowerCase();
+      if (lower.includes("whatsapp")) return "whatsapp";
+      if (lower.includes("telegram")) return "telegram";
+      if (lower.includes("discord")) return "discord";
+      return lower || "unknown";
+    };
+    const omniOfflineReason = (err: unknown, fallback: string): string => {
+      const msg = err instanceof Error ? err.message : String(err);
+      return /unable to connect|access the url|fetch failed|ECONNREFUSED/i.test(msg) ? "omni_offline" : fallback;
+    };
+
+    void (async () => {
+      const omniClient = createOmniClient({ baseUrl: omniApiUrl, apiKey: omniApiKey });
+
+      // List remote channels + their connection status for the TUI picker.
+      void (async () => {
+        try {
+          for await (const _evt of subscribe("otto.channels.list.request")) {
+            try {
+              const { items } = await omniClient.instances.list();
+              const channels = items
+                .filter((i) => i.id)
+                .map((i) => ({
+                  instanceId: i.id,
+                  channel: normalizeChannel(i.channel),
+                  name: i.name ?? null,
+                  isConnected: Boolean(i.isConnected),
+                  profileName: i.profileName ?? null,
+                }));
+              await publish("otto.channels.list.result", { ok: true, channels });
+            } catch (err) {
+              await publish("otto.channels.list.result", {
+                ok: false,
+                reason: omniOfflineReason(err, "list_error"),
+                channels: [],
+              }).catch(() => {});
+            }
+          }
+        } catch {
+          /* subscription ended on shutdown */
+        }
+      })();
+
+      try {
+        for await (const evt of subscribe("otto.channel.connect.request")) {
+          const data = evt.data as { instanceId?: string; channel?: string } | undefined;
+          const channel = (data?.channel ?? "whatsapp").toLowerCase();
+          try {
+            const wanted = data?.instanceId;
+            const { items } = await omniClient.instances.list();
+            const targets = wanted
+              ? items.filter((i) => i.id === wanted)
+              : items.filter((i) => (i.channel ?? "").toLowerCase().includes(channel));
+            if (targets.length === 0) {
+              await publish("otto.channel.connect.result", { ok: false, channel, reason: `no_${channel}_instance` });
+              continue;
+            }
+            for (const inst of targets) {
+              if (!inst.id) continue;
+              if (inst.isConnected) {
+                await publish(`otto.channel.connected.${inst.id}`, {
+                  type: "connected",
+                  instanceId: inst.id,
+                  channelType: channel,
+                });
+                continue;
+              }
+              // WhatsApp pairs via QR (needs the syncFullHistory body); other
+              // channels (e.g. Telegram, already token-configured) just connect.
+              await omniClient.instances.connect(
+                inst.id,
+                channel.includes("whatsapp") ? { whatsapp: { syncFullHistory: false } } : undefined,
+              );
+            }
+          } catch (err) {
+            log.warn("Channel connect request failed", { channel, err });
+            await publish("otto.channel.connect.result", {
+              ok: false,
+              channel,
+              reason: omniOfflineReason(err, "connect_error"),
+            }).catch(() => {});
+          }
+        }
+      } catch {
+        /* subscription ended on shutdown */
+      }
+    })();
+
+    gateway = createGateway({
+      logLevel: config.logLevel,
+      omniSender: sender,
+      omniConsumer,
+    });
+  } else {
+    // No omni — create a stub gateway that handles internal routing only
+    log.warn("Creating gateway without omni — channel delivery will fail");
+    const stubSender = createStubSender();
+    const stubConsumer = createStubConsumer();
+    gateway = createGateway({
+      logLevel: config.logLevel,
+      omniSender: stubSender,
+      omniConsumer: stubConsumer,
+    });
+  }
+
+  await gateway.start();
+  log.info("Gateway started");
+
+  // Step 7: Start runners — leader election ensures only one daemon runs heartbeat/cron
+  // Trigger, ephemeral, and inbox are per-daemon (each daemon handles its own).
+  const isLeader = await tryAcquireLeadership("runners");
+
+  if (isLeader) {
+    startLeadershipRenewal("runners");
+    await startHeartbeatRunner();
+    log.info("Heartbeat runner started (leader)");
+    await startCronRunner();
+    log.info("Cron runner started (leader)");
+    await startTaskCheckpointRunner({
+      canPublishSessionPrompt: (sessionName) => bot?.canAcceptRuntimePrompt(sessionName) ?? true,
+    });
+    log.info("Task checkpoint runner started (leader)");
+  } else {
+    log.info("Not leader — heartbeat, cron, and task checkpoint runners skipped (another daemon is running them)");
+    watchForLeadershipVacancy("runners", async () => {
+      log.info("Leadership vacancy detected — starting heartbeat, cron, and task checkpoint runners");
+      await startHeartbeatRunner();
+      await startCronRunner();
+      await startTaskCheckpointRunner({
+        canPublishSessionPrompt: (sessionName) => bot?.canAcceptRuntimePrompt(sessionName) ?? true,
+      });
+      log.info("Heartbeat, cron, and task checkpoint runners started (new leader)");
+    }).catch((err) => log.error("Leadership watcher failed", err));
+  }
+
+  await startTriggerRunner();
+  log.info("Trigger runner started");
+
+  await startHookRunner();
+  log.info("Hook runner started");
+
+  await startEphemeralRunner();
+  log.info("Ephemeral runner started");
+
+  sessionAdapterBus = createSessionAdapterBus();
+  await sessionAdapterBus.start();
+  log.info("Session adapter bus started");
+
+  webhookHttpServer = startWebhookHttpServerFromEnv();
+  if (webhookHttpServer) {
+    log.info("Webhook HTTP server ready", { url: webhookHttpServer.url });
+    if (!hasLiveAdminContext()) {
+      log.warn(
+        "No admin runtime context exists — gateway will reject all non-open requests until you run `otto daemon init-admin-key`.",
+      );
+    }
+  } else {
+    log.info("Webhook HTTP server disabled (set OTTO_HTTP_PORT to enable)");
+  }
+
+  log.info("Daemon ready");
+
+  // Record (and clear) any restart-reason file once the consumer is ready. This
+  // no longer re-triggers the session — it just notes the reason (see
+  // notifyRestartReason); the operator who restarted already knows why.
+  bot.consumerReady
+    .then(() => notifyRestartReason())
+    .catch((err) => {
+      log.error("Failed to read restart reason", err);
+    });
+}
+
+/**
+ * Stub OmniSender for when omni is not configured.
+ * Logs warnings but doesn't throw.
+ */
+function createStubSender(): OmniSender {
+  return {
+    send: async (instanceId: string, to: string, _text: string) => {
+      log.warn("OmniSender stub: send called but omni not configured", { instanceId, to });
+      return {};
+    },
+    sendTyping: async () => {},
+    sendReaction: async () => {},
+    sendMedia: async () => {
+      return {};
+    },
+    sendSticker: async () => {
+      return {};
+    },
+    getClient: () => {
+      throw new Error("Omni not configured");
+    },
+  } as unknown as OmniSender;
+}
+
+/**
+ * Stub OmniConsumer for when omni is not configured.
+ */
+function createStubConsumer(): OmniConsumer {
+  return {
+    start: async () => {},
+    stop: async () => {},
+    getActiveTarget: () => undefined,
+    clearActiveTarget: () => {},
+  } as unknown as OmniConsumer;
+}
+
+/**
+ * Check if there's a restart reason file and notify the originating session.
+ */
+async function notifyRestartReason() {
+  if (!existsSync(RESTART_REASON_FILE)) {
+    return;
+  }
+
+  let reason: string;
+  try {
+    const raw = readFileSync(RESTART_REASON_FILE, "utf-8").trim();
+    unlinkSync(RESTART_REASON_FILE);
+
+    try {
+      reason = JSON.parse(raw).reason;
+    } catch {
+      reason = raw;
+    }
+  } catch (err) {
+    log.error("Failed to read restart reason file", err);
+    return;
+  }
+
+  if (!reason) return;
+
+  // Deliberately do NOT re-trigger the session on restart: publishing a
+  // "Continue de onde parou" prompt made the agent resume whatever it was doing
+  // (e.g. an infra/WhatsApp saga) and spam the chat. We just record the reason;
+  // the operator who ran `daemon restart` already knows why.
+  log.info("Restart reason noted (session not re-triggered)", { reason });
+}
+
+// Note: startDaemon() is called by CLI's "daemon run" command

@@ -1,0 +1,2058 @@
+/**
+ * Instances Commands - Central config entity for all channels/accounts
+ *
+ * otto instances list
+ * otto instances show <name>
+ * otto instances create <name> [--channel whatsapp] [--agent main]
+ * otto instances set <name> <key> <value>
+ * otto instances get <name> <key>
+ * otto instances enable <name-or-instanceId>
+ * otto instances disable <name-or-instanceId>
+ * otto instances connect <name> [--channel whatsapp]
+ * otto instances disconnect <name>
+ * otto instances status <name>
+ * otto routes list [name]
+ * otto routes show <name> <pattern>
+ * otto routes explain <name> <pattern> [--channel whatsapp]
+ * otto instances routes list <name>
+ * otto instances routes add <name> <pattern> <agent> [--policy open|closed|...] [--priority N] [--session s] [--dm-scope s]
+ * otto instances routes remove <name> <pattern>
+ * otto instances routes set <name> <pattern> <key> <value>
+ * otto instances routes show <name> <pattern>
+ * otto instances pending list <name>
+ * otto instances pending approve <name> <contact-or-chat> [--agent <id>]
+ * otto instances pending reject <name> <contact-or-chat>
+ */
+
+import "reflect-metadata";
+import { mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import qrcode from "qrcode-terminal";
+import { Group, Command, CliOnly, Arg, Option } from "../decorators.js";
+import { fail } from "../context.js";
+import { buildCliOffsetPagination, paginateCliItems } from "../pagination.js";
+import { nats } from "../../nats.js";
+import { createOmniClient } from "../../omni/client.js";
+import {
+  dbGetInstance,
+  dbGetInstanceByInstanceId,
+  dbListInstances,
+  dbUpsertInstance,
+  dbUpdateInstance,
+  dbDeleteInstance,
+  dbRestoreInstance,
+  dbListDeletedInstances,
+  dbGetAgent,
+  dbCreateAgent,
+  dbListAgents,
+  dbGetRoute,
+  dbListRoutes,
+  dbCreateRoute,
+  dbUpdateRoute,
+  dbDeleteRoute,
+  dbRestoreRoute,
+  dbListDeletedRoutes,
+  DmScopeSchema,
+  DmPolicySchema,
+  GroupPolicySchema,
+  ContactIntakeModeSchema,
+  dbGetSetting,
+  dbSetSetting,
+} from "../../router/router-db.js";
+import { loadRouterConfig, matchRoute } from "../../router/index.js";
+import {
+  IGNORED_OMNI_INSTANCE_IDS_SETTING,
+  parseIgnoredOmniInstanceIds,
+  serializeIgnoredOmniInstanceIds,
+} from "../../router/omni-ignore.js";
+import { resolveOmniConnection } from "../../omni-config.js";
+import {
+  getContact,
+  listAccountPending,
+  removeAccountPending,
+  allowContact,
+  normalizePhone,
+  type AccountPendingEntry,
+} from "../../contacts.js";
+import { listSessions, deleteSession } from "../../router/sessions.js";
+import { filterItemsByCanonicalTag } from "../../tags/helpers.js";
+import { searchTagBindingsForSelector } from "../../tags/service.js";
+import type { TagBinding } from "../../tags/types.js";
+import { formatCliRuntimeTarget, getCliRuntimeMismatchMessage, inspectCliRuntimeTarget } from "../runtime-target.js";
+import { formatInspectionSection, printInspectionField } from "../inspection-output.js";
+
+const CONFIG_DB_META = { source: "config-db", freshness: "persisted" } as const;
+const LIVE_OMNI_META = { source: "live-omni", freshness: "live" } as const;
+type ListedRoute = ReturnType<typeof dbListRoutes>[number];
+type OmniInstanceStatus = { isConnected?: boolean; profileName?: string; state?: string };
+
+function printJson(payload: unknown): void {
+  console.log(JSON.stringify(payload, null, 2));
+}
+
+function emitConfigChanged() {
+  nats.emit("otto.config.changed", {}).catch(() => {});
+}
+
+function normalizePendingChatPattern(entry: Pick<AccountPendingEntry, "phone" | "chatId" | "isGroup">): string {
+  const raw = (entry.chatId || entry.phone || "").trim();
+  const normalized = normalizePhone(raw);
+  if (normalized.startsWith("group:")) return normalized;
+  if (entry.isGroup) {
+    const bareGroupId = (normalized || raw).replace(/^group:/, "").replace(/@.*$/, "");
+    if (/^\d+(?:-\d+)?$/.test(bareGroupId)) return `group:${bareGroupId}`;
+  }
+  return normalized || raw;
+}
+
+function findPendingReviewEntry(instanceName: string, ref: string): AccountPendingEntry | null {
+  const normalizedRef = normalizePhone(ref);
+  return (
+    listAccountPending(instanceName).find((entry) => {
+      if (entry.phone === ref || entry.chatId === ref) return true;
+      const entryPhone = normalizePhone(entry.phone);
+      const entryChat = entry.chatId ? normalizePhone(entry.chatId) : "";
+      return Boolean(normalizedRef && (entryPhone === normalizedRef || entryChat === normalizedRef));
+    }) ?? null
+  );
+}
+
+function parseEnabledValue(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (["true", "1", "on", "open", "enabled"].includes(normalized)) return true;
+  if (["false", "0", "off", "closed", "disabled"].includes(normalized)) return false;
+  fail(`Invalid enabled value: ${value}. Valid: true, false`);
+}
+
+function getIgnoredOmniInstanceIds(): string[] {
+  return parseIgnoredOmniInstanceIds(dbGetSetting(IGNORED_OMNI_INSTANCE_IDS_SETTING));
+}
+
+function saveIgnoredOmniInstanceIds(instanceIds: Iterable<string>): void {
+  dbSetSetting(IGNORED_OMNI_INSTANCE_IDS_SETTING, serializeIgnoredOmniInstanceIds(instanceIds));
+  emitConfigChanged();
+}
+
+function resolveInstanceByNameOrId(value: string) {
+  return dbGetInstance(value) ?? dbGetInstanceByInstanceId(value);
+}
+
+function requireInstance(name: string) {
+  const instance = dbGetInstance(name);
+  if (!instance) fail(`Instance not found: ${name}`);
+  return instance;
+}
+
+function printInstanceMutationTarget(name: string): void {
+  const summary = inspectCliRuntimeTarget(name);
+  for (const line of formatCliRuntimeTarget(summary)) {
+    console.log(line);
+  }
+}
+
+function assertInstanceMutationRuntime(name: string, allowRuntimeMismatch?: boolean): void {
+  const summary = inspectCliRuntimeTarget(name);
+  const mismatch = getCliRuntimeMismatchMessage(summary);
+  if (mismatch && !allowRuntimeMismatch) {
+    fail(
+      `${mismatch}\nTarget instance: ${name}\nRe-run with the repo CLI/runtime or pass --allow-runtime-mismatch if you really mean it.`,
+    );
+  }
+}
+
+function inspectRouteLiveWinner(
+  name: string,
+  pattern: string,
+  channel?: string,
+): { winningPattern: string; winningAgent: string } | null {
+  const config = loadRouterConfig();
+
+  if (pattern.startsWith("group:")) {
+    const groupId = pattern.slice("group:".length);
+    const resolved = matchRoute(config, {
+      phone: groupId,
+      groupId,
+      isGroup: true,
+      accountId: name,
+      ...(channel ? { channel } : {}),
+    });
+
+    if (!resolved) {
+      return null;
+    }
+
+    return {
+      winningPattern: resolved.route?.pattern ?? "(instance default)",
+      winningAgent: resolved.agentId,
+    };
+  }
+
+  if (!pattern.includes("*") && /^\d+$/.test(pattern)) {
+    const resolved = matchRoute(config, {
+      phone: pattern,
+      accountId: name,
+      ...(channel ? { channel } : {}),
+    });
+
+    if (!resolved) {
+      return null;
+    }
+
+    return {
+      winningPattern: resolved.route?.pattern ?? "(instance default)",
+      winningAgent: resolved.agentId,
+    };
+  }
+
+  return null;
+}
+
+function getRouteLiveEffect(name: string, pattern: string, expectedAgent?: string, channel?: string) {
+  const winner = inspectRouteLiveWinner(name, pattern, channel);
+  if (!winner) {
+    const exactPattern = pattern.startsWith("group:") || (!pattern.includes("*") && /^\d+$/.test(pattern));
+    return {
+      status: exactPattern ? "unresolved" : "skipped_broad_pattern",
+      verified: false,
+      winningPattern: null,
+      winningAgent: null,
+    };
+  }
+
+  const verified = expectedAgent ? winner.winningPattern === pattern && winner.winningAgent === expectedAgent : false;
+  return {
+    status: expectedAgent ? (verified ? "verified" : "different_winner") : "matched",
+    verified,
+    winningPattern: winner.winningPattern,
+    winningAgent: winner.winningAgent,
+  };
+}
+
+function printRouteLiveEffect(name: string, pattern: string, expectedAgent: string, channel?: string): void {
+  const effect = getRouteLiveEffect(name, pattern, expectedAgent, channel);
+  if (effect.status === "unresolved") {
+    console.log(`  Live effect:   unresolved for ${pattern} on instance ${name}`);
+    return;
+  }
+  if (effect.status === "skipped_broad_pattern") {
+    console.log(`  Live effect:   broad pattern — exact winner check skipped for ${pattern}`);
+    return;
+  }
+
+  console.log(`  Live effect:   ${effect.verified ? "verified" : "different winner"}`);
+  console.log(`  Winning route: ${effect.winningPattern}`);
+  console.log(`  Winning agent: ${effect.winningAgent}`);
+}
+
+function getRouteStatusIcon(pattern: string): string {
+  const contact = getContact(pattern);
+  if (!contact) return "\x1b[33m?\x1b[0m";
+  if (contact.status === "allowed") return "\x1b[32m✓\x1b[0m";
+  if (contact.status === "blocked") return "\x1b[31m✗\x1b[0m";
+  return "\x1b[36m○\x1b[0m";
+}
+
+function printRouteTable(routes: ListedRoute[], includeInstanceColumn: boolean): void {
+  if (includeInstanceColumn) {
+    console.log(
+      "  INSTANCE         ST  PATTERN                              AGENT           POLICY       PRI  SESSION",
+    );
+    console.log(
+      "  ---------------- --  -----------------------------------  --------------  -----------  ---  -------",
+    );
+  } else {
+    console.log("  ST  PATTERN                              AGENT           POLICY       PRI  SESSION");
+    console.log("  --  -----------------------------------  --------------  -----------  ---  -------");
+  }
+
+  for (const route of routes) {
+    const statusIcon = getRouteStatusIcon(route.pattern);
+    const policy = route.policy ?? "-";
+    const session = route.session ?? "-";
+    const channelLabel = route.channel ? ` [${route.channel}]` : "";
+    if (includeInstanceColumn) {
+      console.log(
+        `  ${route.accountId.padEnd(16)} ${statusIcon}   ${route.pattern.padEnd(35)} ${route.agent.padEnd(14)}  ${policy.padEnd(11)}  ${String(route.priority ?? 0).padEnd(3)}  ${session}${channelLabel}`,
+      );
+      continue;
+    }
+
+    console.log(
+      `  ${statusIcon}   ${route.pattern.padEnd(35)} ${route.agent.padEnd(14)}  ${policy.padEnd(11)}  ${String(route.priority ?? 0).padEnd(3)}  ${session}${channelLabel}`,
+    );
+  }
+}
+
+function filterRoutesByTag(routes: ListedRoute[], tagSlug?: string): ListedRoute[] {
+  return filterItemsByCanonicalTag(routes, "route", tagSlug, (route) => String(route.id));
+}
+
+function listRouteTags(routeId: string | number): TagBinding[] {
+  return searchTagBindingsForSelector({ selector: { target: `route:${String(routeId)}` } }).bindings;
+}
+
+function listInstanceTags(name: string): TagBinding[] {
+  return searchTagBindingsForSelector({ selector: { instance: name } }).bindings;
+}
+
+function printRouteList(
+  name?: string,
+  tagSlug?: string,
+  limit?: string,
+  offset?: string,
+  baseCommand: Array<string | null | undefined> = ["otto", "routes", "list", name],
+): void {
+  if (name) {
+    requireInstance(name);
+    const routes = filterRoutesByTag(dbListRoutes(name), tagSlug);
+    const page = paginateCliItems(routes, { limit, offset });
+    const pagination = buildCliOffsetPagination({
+      baseCommand,
+      limit: page.limit,
+      offset: page.offset,
+      returned: page.items.length,
+      total: page.total,
+      options: ["--tag", tagSlug?.trim() || null],
+    });
+
+    if (page.items.length === 0) {
+      console.log(
+        tagSlug ? `No routes tagged "${tagSlug}" for instance "${name}".` : `No routes for instance "${name}".`,
+      );
+      console.log(`\nAdd a route: otto instances routes add ${name} <pattern> <agent>`);
+      return;
+    }
+
+    console.log(tagSlug ? `\nRoutes for: ${name} tagged ${tagSlug}\n` : `\nRoutes for: ${name}\n`);
+    printRouteTable(page.items, false);
+    console.log(`\n  Total: ${page.total} (${page.items.length} returned, limit ${page.limit}, offset ${page.offset})`);
+    if (pagination.nextCommand) {
+      console.log("\n  Next page:");
+      console.log(`    ${pagination.nextCommand}`);
+    }
+    console.log(`  Show one: otto routes show ${name} "<pattern>"`);
+    console.log(`  Explain:  otto routes explain ${name} "<pattern>"`);
+    console.log(`  Mutate:   otto instances routes set ${name} "<pattern>" <key> <value>`);
+    return;
+  }
+
+  const routes = filterRoutesByTag(dbListRoutes(), tagSlug);
+  const page = paginateCliItems(routes, { limit, offset });
+  const pagination = buildCliOffsetPagination({
+    baseCommand,
+    limit: page.limit,
+    offset: page.offset,
+    returned: page.items.length,
+    total: page.total,
+    options: ["--tag", tagSlug?.trim() || null],
+  });
+  if (page.items.length === 0) {
+    console.log(tagSlug ? `No routes tagged "${tagSlug}".` : "No routes configured.");
+    console.log(`\nAdd one: otto instances routes add <instance> <pattern> <agent>`);
+    return;
+  }
+
+  console.log(tagSlug ? `\nRoutes across all instances tagged ${tagSlug}:\n` : "\nRoutes across all instances:\n");
+  printRouteTable(page.items, true);
+  console.log(`\n  Total: ${page.total} (${page.items.length} returned, limit ${page.limit}, offset ${page.offset})`);
+  if (pagination.nextCommand) {
+    console.log("\n  Next page:");
+    console.log(`    ${pagination.nextCommand}`);
+  }
+  console.log(`  Show one: otto routes show <instance> "<pattern>"`);
+  console.log(`  Explain:  otto routes explain <instance> "<pattern>"`);
+  console.log(`  Mutate:   otto instances routes add <instance> <pattern> <agent>`);
+}
+
+function buildRouteListPayload(
+  name?: string,
+  tagSlug?: string,
+  limit?: string,
+  offset?: string,
+  baseCommand: Array<string | null | undefined> = ["otto", "routes", "list", name],
+) {
+  if (name) {
+    requireInstance(name);
+  }
+  const routes = filterRoutesByTag(dbListRoutes(name), tagSlug);
+  const page = paginateCliItems(routes, { limit, offset });
+  const pagination = buildCliOffsetPagination({
+    baseCommand,
+    limit: page.limit,
+    offset: page.offset,
+    returned: page.items.length,
+    total: page.total,
+    options: ["--tag", tagSlug?.trim() || null],
+  });
+  return {
+    instance: name ?? null,
+    filter: { tagSlug: tagSlug?.trim() || null },
+    total: page.total,
+    pagination,
+    items: page.items.map((route) => ({
+      ...route,
+      tags: listRouteTags(route.id),
+    })),
+    routes: page.items.map((route) => ({
+      ...route,
+      tags: listRouteTags(route.id),
+    })),
+  };
+}
+
+function printRouteDetails(name: string, pattern: string): void {
+  requireInstance(name);
+  const route = dbGetRoute(pattern, name);
+  if (!route) fail(`Route not found: ${pattern} (instance: ${name})`);
+
+  console.log(`\nRoute: ${route.pattern} (instance: ${name})\n`);
+  console.log(`  Agent:     ${route.agent}`);
+  console.log(`  Priority:  ${route.priority ?? 0}`);
+  console.log(`  Policy:    ${route.policy ?? "(inherits from instance)"}`);
+  console.log(`  DM Scope:  ${route.dmScope ?? "(inherits)"}`);
+  console.log(`  Session:   ${route.session ?? "(auto)"}`);
+  console.log(`  Channel:   ${route.channel ?? "(all channels)"}`);
+  const routeTags = listRouteTags(route.id);
+  console.log(`  Tags:      ${routeTags.length > 0 ? routeTags.map((tag) => tag.tagSlug).join(", ") : "-"}`);
+  console.log(`\n  Explain live routing: otto routes explain ${name} "${pattern}"`);
+  console.log(`  Mutate config:        otto instances routes set ${name} "${pattern}" <key> <value>`);
+}
+
+function buildRouteDetailsPayload(name: string, pattern: string) {
+  requireInstance(name);
+  const route = dbGetRoute(pattern, name);
+  if (!route) fail(`Route not found: ${pattern} (instance: ${name})`);
+  return {
+    instance: name,
+    pattern,
+    route: {
+      ...route,
+      tags: listRouteTags(route.id),
+    },
+  };
+}
+
+function buildRouteExplanationPayload(name: string, pattern?: string, channel?: string) {
+  const target = inspectCliRuntimeTarget(name);
+
+  if (!target.instance?.exists) {
+    fail(`Instance not found: ${name}`);
+  }
+
+  if (!pattern) {
+    return {
+      target,
+      instance: name,
+      pattern: null,
+      channel: channel ?? null,
+      configuredRoute: null,
+      liveEffect: null,
+    };
+  }
+
+  const configuredRoute = dbGetRoute(pattern, name);
+  if (configuredRoute) {
+    return {
+      target,
+      instance: name,
+      pattern,
+      channel: channel ?? configuredRoute.channel ?? null,
+      configuredRoute,
+      liveEffect: getRouteLiveEffect(
+        name,
+        pattern,
+        configuredRoute.agent,
+        channel ?? configuredRoute.channel ?? undefined,
+      ),
+    };
+  }
+
+  const winner = inspectRouteLiveWinner(name, pattern, channel);
+  return {
+    target,
+    instance: name,
+    pattern,
+    channel: channel ?? null,
+    configuredRoute: null,
+    liveEffect: winner
+      ? {
+          status: "different_winner",
+          verified: false,
+          winningPattern: winner.winningPattern,
+          winningAgent: winner.winningAgent,
+        }
+      : getRouteLiveEffect(name, pattern, undefined, channel),
+  };
+}
+
+function printRouteExplanation(name: string, pattern?: string, channel?: string): void {
+  const summary = inspectCliRuntimeTarget(name);
+  for (const line of formatCliRuntimeTarget(summary)) {
+    console.log(line);
+  }
+
+  if (!summary.instance?.exists) {
+    fail(`Instance not found: ${name}`);
+  }
+
+  if (!pattern) {
+    console.log(`\n  Discover routes: otto routes list ${name}`);
+    console.log(`  Explain one:     otto routes explain ${name} "<pattern>"`);
+    return;
+  }
+
+  const configuredRoute = dbGetRoute(pattern, name);
+  if (configuredRoute) {
+    console.log(`  Config route:  ${configuredRoute.pattern} → ${configuredRoute.agent}`);
+    printRouteLiveEffect(name, pattern, configuredRoute.agent, channel ?? configuredRoute.channel ?? undefined);
+    console.log(`\n  Route details: otto routes show ${name} "${pattern}"`);
+    console.log(`  Mutate config: otto instances routes set ${name} "${pattern}" <key> <value>`);
+    return;
+  }
+
+  const winner = inspectRouteLiveWinner(name, pattern, channel);
+  if (!winner) {
+    if (pattern.startsWith("group:") || (!pattern.includes("*") && /^\d+$/.test(pattern))) {
+      console.log(`  Live effect:   unresolved for ${pattern} on instance ${name}`);
+    } else {
+      console.log(`  Live effect:   broad pattern — exact winner check skipped for ${pattern}`);
+    }
+    console.log(`\n  Route details: otto routes show ${name} "${pattern}"`);
+    console.log(`  Mutate config: otto instances routes add ${name} "${pattern}" <agent>`);
+    return;
+  }
+
+  console.log("  Config route:  (none)");
+  console.log("  Live effect:   different winner");
+  console.log(`  Winning route: ${winner.winningPattern}`);
+  console.log(`  Winning agent: ${winner.winningAgent}`);
+  console.log(`\n  Route details: otto routes show ${name} "${pattern}"`);
+  console.log(`  Mutate config: otto instances routes add ${name} "${pattern}" <agent>`);
+}
+
+function deleteConflictingSessions(pattern: string, targetAgent: string, opts: { silent?: boolean } = {}): number {
+  const sessions = listSessions();
+  let deleted = 0;
+  for (const session of sessions) {
+    if (pattern.startsWith("group:")) {
+      const groupId = pattern.replace("group:", "");
+      if (session.sessionKey.includes(`group:${groupId}`) && session.agentId !== targetAgent) {
+        deleteSession(session.sessionKey);
+        if (!opts.silent) console.log(`  Deleted conflicting session: ${session.sessionKey}`);
+        deleted++;
+      }
+    } else if (pattern.startsWith("lid:")) {
+      const lid = pattern.replace("lid:", "");
+      if (session.sessionKey.includes(`lid:${lid}`) && session.agentId !== targetAgent) {
+        deleteSession(session.sessionKey);
+        if (!opts.silent) console.log(`  Deleted conflicting session: ${session.sessionKey}`);
+        deleted++;
+      }
+    } else if (pattern.includes("*")) {
+      const regex = new RegExp(pattern.replace(/\*/g, ".*"));
+      const match = session.sessionKey.match(/dm:(\d+)/);
+      if (match && regex.test(match[1]) && session.agentId !== targetAgent) {
+        deleteSession(session.sessionKey);
+        if (!opts.silent) console.log(`  Deleted conflicting session: ${session.sessionKey}`);
+        deleted++;
+      }
+    }
+  }
+  return deleted;
+}
+
+function getOmniClient() {
+  const conn = resolveOmniConnection();
+  if (!conn) fail("Omni not configured. Is omni running?");
+  return createOmniClient({ baseUrl: conn.apiUrl, apiKey: conn.apiKey });
+}
+
+const SETTABLE_KEYS = [
+  "agent",
+  "dmPolicy",
+  "groupPolicy",
+  "contactIntakeMode",
+  "defaultContactTags",
+  "dmScope",
+  "instanceId",
+  "channel",
+  "enabled",
+  "defaults",
+] as const;
+type SettableKey = (typeof SETTABLE_KEYS)[number];
+
+function parseDefaultContactTagsInput(value: string): string[] {
+  const trimmed = value.trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (!Array.isArray(parsed)) {
+        fail("defaultContactTags JSON must be an array of strings");
+      }
+      return (parsed as unknown[])
+        .filter((entry): entry is string => typeof entry === "string")
+        .map((tag) => tag.trim())
+        .filter((tag) => tag.length > 0);
+    } catch {
+      fail("defaultContactTags must be valid JSON when starting with '['");
+    }
+  }
+  return trimmed
+    .split(",")
+    .map((tag) => tag.trim())
+    .filter((tag) => tag.length > 0);
+}
+
+const ROUTE_SETTABLE_KEYS = ["agent", "priority", "dmScope", "session", "policy", "channel"] as const;
+
+// ============================================================================
+// Main group
+// ============================================================================
+
+@Group({
+  name: "instances",
+  description: "Instance management (channels, policies, routes)",
+  scope: "admin",
+})
+export class InstancesCommands {
+  // --------------------------------------------------------------------------
+  // list
+  // --------------------------------------------------------------------------
+  @Command({ name: "list", description: "List all instances" })
+  async list(
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+    @Option({ flags: "--tag <slug>", description: "Filter by canonical instance tag" }) tagSlug?: string,
+    @Option({ flags: "--limit <n>", description: "Page size (default: 50, max: 500)" }) limit?: string,
+    @Option({ flags: "--offset <n>", description: "Number of matching instances to skip (default: 0)" })
+    offset?: string,
+  ) {
+    const instances = filterItemsByCanonicalTag(dbListInstances(), "instance", tagSlug, (inst) => inst.name);
+    const page = paginateCliItems(instances, { limit, offset });
+    const pageInstances = page.items;
+    const pagination = buildCliOffsetPagination({
+      baseCommand: ["otto", "instances", "list"],
+      limit: page.limit,
+      offset: page.offset,
+      returned: pageInstances.length,
+      total: page.total,
+      options: ["--tag", tagSlug?.trim() || null],
+    });
+    const ignoredOmniInstanceIds = getIgnoredOmniInstanceIds();
+
+    // Try to enrich with omni status
+    const omniStatus: Record<string, OmniInstanceStatus> = {};
+    try {
+      const omni = getOmniClient();
+      const result = await omni.instances.list({});
+      for (const item of result.items as Array<{ id?: string; isActive?: boolean; profileName?: string }>) {
+        if (item.id) omniStatus[item.id] = { isConnected: item.isActive, profileName: item.profileName };
+      }
+    } catch {
+      /* omni offline */
+    }
+
+    const payload = {
+      filter: { tagSlug: tagSlug?.trim() || null },
+      total: page.total,
+      pagination,
+      items: pageInstances.map((inst) => ({
+        ...inst,
+        tags: listInstanceTags(inst.name),
+        ottoStatus: inst.enabled === false ? "disabled" : "enabled",
+        live: inst.instanceId ? (omniStatus[inst.instanceId] ?? null) : null,
+      })),
+      instances: pageInstances.map((inst) => ({
+        ...inst,
+        tags: listInstanceTags(inst.name),
+        ottoStatus: inst.enabled === false ? "disabled" : "enabled",
+        live: inst.instanceId ? (omniStatus[inst.instanceId] ?? null) : null,
+      })),
+      ignoredOmniInstanceIds,
+    };
+
+    if (asJson) {
+      printJson(payload);
+    } else if (pageInstances.length === 0) {
+      console.log(tagSlug ? `No registered instances tagged "${tagSlug}".` : "No registered instances configured.");
+      if (ignoredOmniInstanceIds.length > 0) {
+        console.log("\nIgnored unknown omni instanceIds:\n");
+        for (const instanceId of ignoredOmniInstanceIds) {
+          console.log(`  ${instanceId}`);
+        }
+      } else {
+        console.log("\nCreate one: otto instances create <name> --channel whatsapp");
+      }
+    } else {
+      console.log("\nInstances:\n");
+      console.log(
+        "  NAME                 CHANNEL       AGENT           OTTO      DM           GROUP        INTAKE       STATUS",
+      );
+      console.log(
+        "  -------------------- ------------- --------------- --------- ------------ ------------ ------------ ----------",
+      );
+
+      for (const inst of pageInstances) {
+        const status = inst.instanceId
+          ? omniStatus[inst.instanceId]?.isConnected
+            ? "connected"
+            : "disconnected"
+          : "no-omni-id";
+        const profile = inst.instanceId ? (omniStatus[inst.instanceId]?.profileName ?? "") : "";
+        const label = profile ? `${status} (${profile})` : status;
+        console.log(
+          `  ${inst.name.padEnd(20)} ${inst.channel.padEnd(13)} ${(inst.agent ?? "-").padEnd(15)} ${(inst.enabled === false ? "disabled" : "enabled").padEnd(9)} ${inst.dmPolicy.padEnd(12)} ${inst.groupPolicy.padEnd(12)} ${inst.contactIntakeMode.padEnd(12)} ${label}`,
+        );
+      }
+      console.log(
+        `\n  Total: ${page.total} (${pageInstances.length} returned, limit ${page.limit}, offset ${page.offset})`,
+      );
+      if (pagination.nextCommand) {
+        console.log("\n  Next page:");
+        console.log(`    ${pagination.nextCommand}`);
+      }
+
+      if (ignoredOmniInstanceIds.length > 0) {
+        console.log("\nIgnored unknown omni instanceIds:\n");
+        for (const instanceId of ignoredOmniInstanceIds) {
+          console.log(`  ${instanceId}`);
+        }
+      }
+    }
+    return payload;
+  }
+
+  // --------------------------------------------------------------------------
+  // show
+  // --------------------------------------------------------------------------
+  @Command({ name: "show", description: "Show instance details" })
+  async show(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    const inst = requireInstance(name);
+
+    const routes = dbListRoutes(name);
+
+    let omniInfo: OmniInstanceStatus = {};
+    if (inst.instanceId) {
+      try {
+        const omni = getOmniClient();
+        omniInfo = (await omni.instances.status(inst.instanceId)) as typeof omniInfo;
+      } catch {
+        /* omni offline */
+      }
+    }
+
+    const payload = {
+      instance: {
+        ...inst,
+        tags: listInstanceTags(inst.name),
+        ottoStatus: inst.enabled === false ? "disabled" : "enabled",
+      },
+      routes,
+      live: inst.instanceId ? omniInfo : null,
+    };
+
+    if (asJson) {
+      printJson(payload);
+    } else {
+      console.log(`\nInstance: ${inst.name}\n`);
+      printInspectionField("Channel", inst.channel, CONFIG_DB_META);
+      printInspectionField("Instance ID", inst.instanceId ?? "(not set)", CONFIG_DB_META);
+      printInspectionField("Otto", inst.enabled === false ? "disabled" : "enabled", CONFIG_DB_META);
+      printInspectionField("Agent", inst.agent ?? "(default)", CONFIG_DB_META);
+      printInspectionField("DM Policy", inst.dmPolicy, CONFIG_DB_META);
+      printInspectionField("Group Policy", inst.groupPolicy, CONFIG_DB_META);
+      printInspectionField("Contact Intake", inst.contactIntakeMode, CONFIG_DB_META);
+      const defaultContactTagList =
+        inst.defaultContactTags && inst.defaultContactTags.length > 0 ? inst.defaultContactTags.join(", ") : "-";
+      printInspectionField("Default Contact Tags", defaultContactTagList, CONFIG_DB_META);
+      const instanceTags = listInstanceTags(inst.name);
+      printInspectionField(
+        "Tags",
+        instanceTags.length > 0 ? instanceTags.map((tag) => tag.tagSlug).join(", ") : "-",
+        CONFIG_DB_META,
+      );
+      if (inst.dmScope) printInspectionField("DM Scope", inst.dmScope, CONFIG_DB_META);
+      if (inst.defaults && Object.keys(inst.defaults).length > 0) {
+        printInspectionField("Defaults", JSON.stringify(inst.defaults), CONFIG_DB_META);
+      }
+      if (inst.instanceId) {
+        printInspectionField("Connected", omniInfo.isConnected ?? "unknown", LIVE_OMNI_META);
+        if (omniInfo.profileName) printInspectionField("Profile", omniInfo.profileName, LIVE_OMNI_META);
+      }
+      console.log(`\n${formatInspectionSection(`  Routes (${routes.length}):`, CONFIG_DB_META)}`);
+      if (routes.length === 0) {
+        console.log(`    (none — all messages go to agent "${inst.agent ?? "default"}")`);
+      } else {
+        for (const r of routes) {
+          const policy = r.policy ? ` [policy:${r.policy}]` : "";
+          console.log(`    ${r.pattern.padEnd(35)} → ${r.agent}${policy}  pri=${r.priority ?? 0}`);
+        }
+      }
+    }
+    return payload;
+  }
+
+  // --------------------------------------------------------------------------
+  // create
+  // --------------------------------------------------------------------------
+  @Command({ name: "create", description: "Create a new instance" })
+  create(
+    @Arg("name", { description: "Instance name (e.g., main, vendas)" }) name: string,
+    @Option({ flags: "--channel <channel>", description: "Channel type (default: whatsapp)" }) channel?: string,
+    @Option({ flags: "--agent <id>", description: "Default agent for this instance" }) agent?: string,
+    @Option({ flags: "--dm-policy <policy>", description: "DM policy: open|pairing|closed (default: open)" })
+    dmPolicy?: string,
+    @Option({ flags: "--group-policy <policy>", description: "Group policy: open|allowlist|closed (default: open)" })
+    groupPolicy?: string,
+    @Option({
+      flags: "--contact-intake-mode <mode>",
+      description: "Inbound DM contact intake: off|discovered|pending (default: off)",
+    })
+    contactIntakeMode?: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    if (agent && !dbGetAgent(agent)) {
+      fail(
+        `Agent not found: ${agent}. Available: ${dbListAgents()
+          .map((a) => a.id)
+          .join(", ")}`,
+      );
+    }
+    if (dmPolicy) {
+      const r = DmPolicySchema.safeParse(dmPolicy);
+      if (!r.success) fail(`Invalid dmPolicy: ${dmPolicy}. Valid: open, pairing, closed`);
+    }
+    if (groupPolicy) {
+      const r = GroupPolicySchema.safeParse(groupPolicy);
+      if (!r.success) fail(`Invalid groupPolicy: ${groupPolicy}. Valid: open, allowlist, closed`);
+    }
+    if (contactIntakeMode) {
+      const r = ContactIntakeModeSchema.safeParse(contactIntakeMode);
+      if (!r.success) fail(`Invalid contactIntakeMode: ${contactIntakeMode}. Valid: off, discovered, pending`);
+    }
+    try {
+      const instance = dbUpsertInstance({
+        name,
+        channel: channel ?? "whatsapp",
+        agent: agent ?? undefined,
+        dmPolicy: (dmPolicy ?? "open") as "open" | "pairing" | "closed",
+        groupPolicy: (groupPolicy ?? "open") as "open" | "allowlist" | "closed",
+        contactIntakeMode: (contactIntakeMode ?? "off") as "off" | "discovered" | "pending",
+      });
+      const payload = {
+        status: "created" as const,
+        instance,
+        changedCount: 1,
+      };
+      if (asJson) {
+        printJson(payload);
+      } else {
+        console.log(`✓ Instance created: ${name} (channel: ${channel ?? "whatsapp"})`);
+        if (agent) console.log(`  Agent: ${agent}`);
+      }
+      emitConfigChanged();
+      return payload;
+    } catch (err) {
+      fail(`Error: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // get
+  // --------------------------------------------------------------------------
+  @Command({ name: "get", description: "Get an instance property" })
+  get(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Arg("key", { description: `Property key (${SETTABLE_KEYS.join(", ")})` }) key: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    const inst = dbGetInstance(name);
+    if (!inst) fail(`Instance not found: ${name}`);
+    const val = (inst as unknown as Record<string, unknown>)[key];
+    if (val === undefined) fail(`Unknown key: ${key}. Valid keys: ${SETTABLE_KEYS.join(", ")}`);
+    const payload = {
+      instance: name,
+      key,
+      value: val ?? null,
+    };
+    if (asJson) {
+      printJson(payload);
+    } else {
+      console.log(`${name}.${key}: ${val ?? "(not set)"}`);
+    }
+    return payload;
+  }
+
+  // --------------------------------------------------------------------------
+  // set
+  // --------------------------------------------------------------------------
+  @Command({ name: "set", description: "Set an instance property" })
+  set(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Arg("key", { description: `Property key (${SETTABLE_KEYS.join(", ")})` }) key: string,
+    @Arg("value", { description: "Property value (use '-' to clear)" }) value: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    if (!SETTABLE_KEYS.includes(key as SettableKey)) {
+      fail(`Invalid key: ${key}. Valid keys: ${SETTABLE_KEYS.join(", ")}`);
+    }
+    const inst = dbGetInstance(name);
+    if (!inst) fail(`Instance not found: ${name}. Create it first with: otto instances create ${name}`);
+
+    const clear = value === "-" || value === "null";
+
+    let jsonValue: unknown = clear ? null : value;
+
+    if (key === "agent") {
+      if (!clear && !dbGetAgent(value)) fail(`Agent not found: ${value}`);
+      dbUpdateInstance(name, { agent: clear ? undefined : value });
+    } else if (key === "dmPolicy") {
+      const r = DmPolicySchema.safeParse(value);
+      if (!r.success) fail(`Invalid dmPolicy: ${value}. Valid: open, pairing, closed`);
+      dbUpdateInstance(name, { dmPolicy: r.data });
+    } else if (key === "groupPolicy") {
+      const r = GroupPolicySchema.safeParse(value);
+      if (!r.success) fail(`Invalid groupPolicy: ${value}. Valid: open, allowlist, closed`);
+      dbUpdateInstance(name, { groupPolicy: r.data });
+    } else if (key === "contactIntakeMode") {
+      const r = ContactIntakeModeSchema.safeParse(value);
+      if (!r.success) fail(`Invalid contactIntakeMode: ${value}. Valid: off, discovered, pending`);
+      dbUpdateInstance(name, { contactIntakeMode: r.data });
+    } else if (key === "dmScope") {
+      if (!clear) {
+        const r = DmScopeSchema.safeParse(value);
+        if (!r.success) fail(`Invalid dmScope: ${value}. Valid: ${DmScopeSchema.options.join(", ")}`);
+      }
+      dbUpdateInstance(name, { dmScope: clear ? undefined : (value as typeof inst.dmScope) });
+    } else if (key === "instanceId") {
+      dbUpdateInstance(name, { instanceId: clear ? undefined : value });
+    } else if (key === "channel") {
+      jsonValue = value;
+      dbUpdateInstance(name, { channel: value });
+    } else if (key === "enabled") {
+      if (clear) fail("enabled cannot be cleared");
+      jsonValue = parseEnabledValue(value);
+      dbUpdateInstance(name, { enabled: jsonValue as boolean });
+    } else if (key === "defaults") {
+      if (clear) {
+        dbUpdateInstance(name, { defaults: null });
+      } else {
+        try {
+          jsonValue = JSON.parse(value);
+          if (typeof jsonValue !== "object" || jsonValue === null || Array.isArray(jsonValue)) {
+            fail(`defaults must be a JSON object, e.g. '{"image_provider":"openai","image_model":"gpt-image-2"}'`);
+          }
+        } catch {
+          fail(`defaults must be valid JSON object, e.g. '{"image_provider":"openai","image_model":"gpt-image-2"}'`);
+        }
+        dbUpdateInstance(name, { defaults: jsonValue as Record<string, unknown> });
+      }
+    } else if (key === "defaultContactTags") {
+      if (clear) {
+        jsonValue = [];
+        dbUpdateInstance(name, { defaultContactTags: null });
+      } else {
+        const tags = parseDefaultContactTagsInput(value);
+        jsonValue = tags;
+        dbUpdateInstance(name, { defaultContactTags: tags });
+      }
+    }
+
+    const updated = dbGetInstance(name);
+    const payload = {
+      status: "updated" as const,
+      key,
+      value: jsonValue,
+      instance: updated,
+      changedCount: 1,
+    };
+    if (asJson) {
+      printJson(payload);
+    } else {
+      console.log(`✓ ${name}.${key} = ${clear ? "(cleared)" : value}`);
+    }
+    emitConfigChanged();
+    return payload;
+  }
+
+  // --------------------------------------------------------------------------
+  // enable
+  // --------------------------------------------------------------------------
+  @Command({ name: "enable", description: "Enable an instance in Otto without changing omni" })
+  enable(
+    @Arg("target", { description: "Instance name or omni instanceId" }) target: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    const inst = resolveInstanceByNameOrId(target);
+    if (!inst) {
+      const ignored = getIgnoredOmniInstanceIds();
+      if (!ignored.includes(target)) fail(`Instance not found: ${target}`);
+      saveIgnoredOmniInstanceIds(ignored.filter((instanceId) => instanceId !== target));
+      const payload = {
+        status: "ignored_removed" as const,
+        target,
+        changedCount: 1,
+        ignoredOmniInstanceIds: getIgnoredOmniInstanceIds(),
+      };
+      if (asJson) {
+        printJson(payload);
+      } else {
+        console.log(`✓ Removed ignored unknown omni instanceId from otto: ${target}`);
+      }
+      return payload;
+    }
+    if (inst.enabled !== false) {
+      const payload = {
+        status: "unchanged" as const,
+        target,
+        instance: inst,
+        changedCount: 0,
+      };
+      if (asJson) {
+        printJson(payload);
+      } else {
+        console.log(`Instance already enabled in otto: ${inst.name}`);
+      }
+      return payload;
+    }
+    const updated = dbUpdateInstance(inst.name, { enabled: true });
+    const payload = {
+      status: "enabled" as const,
+      target,
+      instance: updated,
+      changedCount: 1,
+    };
+    if (asJson) {
+      printJson(payload);
+    } else {
+      console.log(`✓ Instance enabled in otto: ${inst.name}`);
+    }
+    emitConfigChanged();
+    return payload;
+  }
+
+  // --------------------------------------------------------------------------
+  // disable
+  // --------------------------------------------------------------------------
+  @Command({ name: "disable", description: "Disable an instance in Otto without changing omni" })
+  disable(
+    @Arg("target", { description: "Instance name or omni instanceId" }) target: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    const inst = resolveInstanceByNameOrId(target);
+    if (!inst) {
+      const ignored = getIgnoredOmniInstanceIds();
+      if (ignored.includes(target)) {
+        const payload = {
+          status: "unchanged" as const,
+          target,
+          changedCount: 0,
+          ignoredOmniInstanceIds: ignored,
+        };
+        if (asJson) {
+          printJson(payload);
+        } else {
+          console.log(`Unknown omni instanceId already ignored in otto: ${target}`);
+        }
+        return payload;
+      }
+      saveIgnoredOmniInstanceIds([...ignored, target]);
+      const payload = {
+        status: "ignored" as const,
+        target,
+        changedCount: 1,
+        ignoredOmniInstanceIds: getIgnoredOmniInstanceIds(),
+      };
+      if (asJson) {
+        printJson(payload);
+      } else {
+        console.log(`✓ Ignoring unknown omni instanceId in otto: ${target}`);
+      }
+      return payload;
+    }
+    if (inst.enabled === false) {
+      const payload = {
+        status: "unchanged" as const,
+        target,
+        instance: inst,
+        changedCount: 0,
+      };
+      if (asJson) {
+        printJson(payload);
+      } else {
+        console.log(`Instance already disabled in otto: ${inst.name}`);
+      }
+      return payload;
+    }
+    const updated = dbUpdateInstance(inst.name, { enabled: false });
+    const payload = {
+      status: "disabled" as const,
+      target,
+      instance: updated,
+      changedCount: 1,
+    };
+    if (asJson) {
+      printJson(payload);
+    } else {
+      console.log(`✓ Instance disabled in otto: ${inst.name}`);
+    }
+    emitConfigChanged();
+    return payload;
+  }
+
+  // --------------------------------------------------------------------------
+  // delete
+  // --------------------------------------------------------------------------
+  @Command({ name: "delete", description: "Delete an instance (soft-delete, recoverable)" })
+  delete(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    const inst = dbGetInstance(name);
+    if (!inst) fail(`Instance not found: ${name}`);
+    const deleted = dbDeleteInstance(name);
+    if (deleted) {
+      const payload = {
+        status: "deleted" as const,
+        instance: inst,
+        changedCount: 1,
+      };
+      if (asJson) {
+        printJson(payload);
+      } else {
+        console.log(`✓ Instance deleted: ${name} (recoverable with: otto instances restore ${name})`);
+      }
+      emitConfigChanged();
+      return payload;
+    } else {
+      fail(`Failed to delete instance: ${name}`);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // restore
+  // --------------------------------------------------------------------------
+  @Command({ name: "restore", description: "Restore a soft-deleted instance" })
+  restore(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    const ok = dbRestoreInstance(name);
+    if (ok) {
+      const payload = {
+        status: "restored" as const,
+        instance: dbGetInstance(name),
+        changedCount: 1,
+      };
+      if (asJson) {
+        printJson(payload);
+      } else {
+        console.log(`✓ Instance restored: ${name}`);
+      }
+      emitConfigChanged();
+      return payload;
+    } else {
+      fail(`Instance not found in deleted records: ${name}`);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // deleted
+  // --------------------------------------------------------------------------
+  @Command({ name: "deleted", description: "List soft-deleted instances" })
+  deleted(@Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean) {
+    const instances = dbListDeletedInstances();
+    const payload = {
+      total: instances.length,
+      instances,
+    };
+    if (asJson) {
+      printJson(payload);
+    } else if (instances.length === 0) {
+      console.log("No deleted instances.");
+    } else {
+      console.log("\nDeleted Instances:\n");
+      for (const inst of instances) {
+        const deletedAt = new Date(inst.deletedAt!).toLocaleString();
+        console.log(`  ${inst.name.padEnd(20)} channel: ${inst.channel.padEnd(12)} deleted: ${deletedAt}`);
+      }
+      console.log(`\nRestore with: otto instances restore <name>`);
+    }
+    return payload;
+  }
+
+  // --------------------------------------------------------------------------
+  // connect
+  // --------------------------------------------------------------------------
+  @Command({ name: "connect", description: "Connect an instance to omni (QR code for WhatsApp)" })
+  @CliOnly()
+  async connect(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Option({ flags: "--channel <channel>", description: "Channel type (default: whatsapp)" }) channelOpt?: string,
+    @Option({ flags: "--agent <id>", description: "Agent to route messages to" }) agent?: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    const TIMEOUT_MS = 120_000;
+    const omni = getOmniClient();
+    let createdOmniInstance = false;
+    let createdAgent: { id: string; cwd: string } | null = null;
+
+    let inst = dbGetInstance(name);
+    const channel = channelOpt ?? inst?.channel ?? "whatsapp";
+    const omniChannel = channel === "whatsapp" ? "whatsapp-baileys" : channel;
+
+    // Resolve or create omni instance
+    let instanceId = inst?.instanceId ?? "";
+    if (!instanceId) {
+      // Try to find existing in omni by name
+      try {
+        const result = await omni.instances.list({ channel: omniChannel });
+        const existing = (result.items as Array<{ id?: string; name?: string }>).find((i) => i.name === name);
+        if (existing?.id) instanceId = existing.id;
+      } catch {
+        /* omni offline */
+      }
+    }
+
+    if (!instanceId) {
+      if (!asJson) console.log(`Creating ${channel} instance "${name}" in omni...`);
+      try {
+        const created = (await omni.instances.create({ name, channel: omniChannel })) as { id?: string };
+        instanceId = created.id ?? "";
+        createdOmniInstance = true;
+        if (!asJson) console.log(`✓ Instance created in omni: ${instanceId}`);
+      } catch (err) {
+        fail(`Failed to create instance in omni: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+    }
+
+    // Upsert local instance record
+    const agentId = agent ?? inst?.agent ?? (dbGetAgent(name) ? name : undefined);
+    dbUpsertInstance({ name, instanceId, channel, agent: agentId ?? undefined, enabled: inst?.enabled !== false });
+    if (agentId && !dbGetAgent(agentId)) {
+      const cwd = `${homedir()}/otto/${agentId}`;
+      mkdirSync(cwd, { recursive: true });
+      dbCreateAgent({ id: agentId, cwd });
+      createdAgent = { id: agentId, cwd };
+      if (!asJson) console.log(`✓ Created agent "${agentId}" at ${cwd}`);
+    }
+
+    emitConfigChanged();
+    inst = dbGetInstance(name)!;
+    if (!asJson) console.log(`Connecting: ${name} → agent ${inst.agent ?? "(default)"}  [${channel}]`);
+
+    // Check if already connected
+    try {
+      const status = (await omni.instances.status(instanceId)) as { isConnected?: boolean; profileName?: string };
+      if (status.isConnected) {
+        if (asJson) {
+          printJson({
+            status: "connected",
+            instance: inst,
+            live: status,
+            createdOmniInstance,
+            createdAgent,
+            changedCount: 1,
+          });
+          return;
+        }
+        const profile = status.profileName ? ` as ${status.profileName}` : "";
+        console.log(`\n✓ Already connected${profile}`);
+        return;
+      }
+    } catch {
+      /* ignore */
+    }
+
+    // Initiate connection
+    if (!asJson) console.log("Waiting for QR code...\n");
+    try {
+      await omni.instances.connect(instanceId, { whatsapp: { syncFullHistory: false } });
+    } catch (err) {
+      fail(`Failed to initiate connection: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+
+    const qrTopic = `otto.channel.qr.${instanceId}`;
+    const connectedTopic = `otto.channel.connected.${instanceId}`;
+
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        if (asJson) {
+          reject(new Error("Timeout waiting for connection (120s)"));
+          return;
+        }
+        console.error("\n✗ Timeout waiting for connection (120s)");
+        process.exit(1);
+      }, TIMEOUT_MS);
+
+      (async () => {
+        try {
+          for await (const event of nats.subscribe(qrTopic, connectedTopic)) {
+            if (settled) break;
+            const data = event.data as Record<string, unknown>;
+            if (event.topic === qrTopic && data.type === "qr") {
+              if (asJson) {
+                clearTimeout(timer);
+                settled = true;
+                printJson({
+                  status: "qr_required",
+                  instance: inst,
+                  instanceId,
+                  channel,
+                  qr: data.qr ?? null,
+                  createdOmniInstance,
+                  createdAgent,
+                  changedCount: 1,
+                });
+                resolve();
+                return;
+              }
+              console.log("Scan this QR code:\n");
+              qrcode.generate(data.qr as string, { small: true });
+            } else if (event.topic === connectedTopic && data.type === "connected") {
+              clearTimeout(timer);
+              settled = true;
+              if (asJson) {
+                printJson({
+                  status: "connected",
+                  instance: inst,
+                  live: data,
+                  createdOmniInstance,
+                  createdAgent,
+                  changedCount: 1,
+                });
+                resolve();
+                return;
+              }
+              const profile = data.profileName ? ` as ${data.profileName}` : "";
+              console.log(`\n✓ Connected${profile}`);
+              resolve();
+              process.exit(0);
+            }
+          }
+        } catch (err) {
+          if (!settled) {
+            clearTimeout(timer);
+            settled = true;
+            reject(err);
+          }
+        }
+      })();
+    });
+  }
+
+  // --------------------------------------------------------------------------
+  // disconnect
+  // --------------------------------------------------------------------------
+  @Command({ name: "disconnect", description: "Disconnect an instance from omni" })
+  async disconnect(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    const inst = dbGetInstance(name);
+    if (!inst) fail(`Instance not found: ${name}`);
+    if (!inst.instanceId) fail(`Instance "${name}" has no omni instanceId set`);
+    try {
+      const omni = getOmniClient();
+      await omni.instances.disconnect(inst.instanceId!);
+      const payload = {
+        status: "disconnected" as const,
+        instance: inst,
+        changedCount: 1,
+      };
+      if (asJson) {
+        printJson(payload);
+      } else {
+        console.log(`✓ Disconnected: ${name}`);
+      }
+      return payload;
+    } catch (err) {
+      fail(`Failed to disconnect: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // status
+  // --------------------------------------------------------------------------
+  @Command({ name: "status", description: "Show connection status for an instance" })
+  async status(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    const inst = dbGetInstance(name);
+    if (!inst) fail(`Instance not found: ${name}`);
+    if (!inst.instanceId) {
+      const payload = {
+        instance: inst,
+        live: null,
+        status: "no_omni_id" as const,
+      };
+      if (asJson) {
+        printJson(payload);
+      } else {
+        console.log(`\nInstance: ${name}\n  instanceId: (not set — run "otto instances connect ${name}")`);
+      }
+      return payload;
+    }
+    try {
+      const omni = getOmniClient();
+      const s = (await omni.instances.status(inst.instanceId!)) as {
+        isConnected?: boolean;
+        profileName?: string;
+        state?: string;
+      };
+      const payload = {
+        instance: {
+          ...inst,
+          ottoStatus: inst.enabled === false ? "disabled" : "enabled",
+        },
+        live: s,
+        status: (s.isConnected ? "connected" : "disconnected") as "connected" | "disconnected",
+      };
+      if (asJson) {
+        printJson(payload);
+      } else {
+        console.log(`\nInstance: ${name}\n`);
+        printInspectionField("Instance ID", inst.instanceId, CONFIG_DB_META, { labelWidth: 15 });
+        printInspectionField("Channel", inst.channel, CONFIG_DB_META, { labelWidth: 15 });
+        printInspectionField("Otto", inst.enabled === false ? "disabled" : "enabled", CONFIG_DB_META, {
+          labelWidth: 15,
+        });
+        printInspectionField("State", s.state ?? "unknown", LIVE_OMNI_META, { labelWidth: 15 });
+        printInspectionField("Connected", s.isConnected ?? false, LIVE_OMNI_META, { labelWidth: 15 });
+        if (s.profileName) printInspectionField("Profile", s.profileName, LIVE_OMNI_META, { labelWidth: 15 });
+        printInspectionField("Agent", inst.agent ?? "(default)", CONFIG_DB_META, { labelWidth: 15 });
+        printInspectionField("DM Policy", inst.dmPolicy, CONFIG_DB_META, { labelWidth: 15 });
+        printInspectionField("Group Policy", inst.groupPolicy, CONFIG_DB_META, { labelWidth: 15 });
+        printInspectionField("Contact Intake", inst.contactIntakeMode, CONFIG_DB_META, { labelWidth: 15 });
+      }
+      return payload;
+    } catch (err) {
+      fail(`Error fetching status: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  @Command({ name: "target", description: "Explain which runtime, DB, and live instance this CLI would affect" })
+  target(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Option({
+      flags: "--pattern <pattern>",
+      description: "Optional exact pattern to inspect against the live resolver (e.g. group:123456)",
+    })
+    pattern?: string,
+    @Option({
+      flags: "--channel <channel>",
+      description: "Optional channel hint for live route inspection",
+    })
+    channel?: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    const payload = buildRouteExplanationPayload(name, pattern, channel);
+    if (asJson) {
+      printJson(payload);
+    } else {
+      printRouteExplanation(name, pattern, channel);
+    }
+    return payload;
+  }
+}
+
+// ============================================================================
+// routes top-level read-only group
+// ============================================================================
+
+@Group({
+  name: "routes",
+  description: "Inspect route config and live routing without drilling into instances",
+  scope: "admin",
+})
+export class RoutesCommands {
+  @Command({ name: "list", description: "List routes across all instances or for one instance" })
+  list(
+    @Arg("name", { description: "Instance name (omit for all)", required: false }) name?: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+    @Option({ flags: "--tag <slug>", description: "Filter by canonical route tag" }) tagSlug?: string,
+    @Option({ flags: "--limit <n>", description: "Page size (default: 50, max: 500)" }) limit?: string,
+    @Option({ flags: "--offset <n>", description: "Number of matching routes to skip (default: 0)" }) offset?: string,
+  ) {
+    const payload = buildRouteListPayload(name, tagSlug, limit, offset);
+    if (asJson) {
+      printJson(payload);
+    } else {
+      printRouteList(name, tagSlug, limit, offset);
+    }
+    return payload;
+  }
+
+  @Command({ name: "show", description: "Show route details" })
+  show(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Arg("pattern", { description: "Route pattern" }) pattern: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    const payload = buildRouteDetailsPayload(name, pattern);
+    if (asJson) {
+      printJson(payload);
+    } else {
+      printRouteDetails(name, pattern);
+    }
+    return payload;
+  }
+
+  @Command({ name: "explain", description: "Explain how a pattern resolves in config and the live router" })
+  explain(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Arg("pattern", { description: "Route pattern" }) pattern: string,
+    @Option({
+      flags: "--channel <channel>",
+      description: "Optional channel hint for live route inspection",
+    })
+    channel?: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    const payload = buildRouteExplanationPayload(name, pattern, channel);
+    if (asJson) {
+      printJson(payload);
+    } else {
+      printRouteExplanation(name, pattern, channel);
+    }
+    return payload;
+  }
+}
+
+// ============================================================================
+// instances.routes subgroup
+// ============================================================================
+
+@Group({
+  name: "instances.routes",
+  description: "Manage routes for an instance",
+  scope: "admin",
+})
+export class InstancesRoutesCommands {
+  @Command({ name: "list", description: "List routes for an instance" })
+  list(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+    @Option({ flags: "--tag <slug>", description: "Filter by canonical route tag" }) tagSlug?: string,
+    @Option({ flags: "--limit <n>", description: "Page size (default: 50, max: 500)" }) limit?: string,
+    @Option({ flags: "--offset <n>", description: "Number of matching routes to skip (default: 0)" }) offset?: string,
+  ) {
+    const baseCommand = ["otto", "instances", "routes", "list", name];
+    const payload = buildRouteListPayload(name, tagSlug, limit, offset, baseCommand);
+    if (asJson) {
+      printJson(payload);
+    } else {
+      printRouteList(name, tagSlug, limit, offset, baseCommand);
+    }
+    return payload;
+  }
+
+  @Command({ name: "show", description: "Show route details" })
+  show(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Arg("pattern", { description: "Route pattern" }) pattern: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    const payload = buildRouteDetailsPayload(name, pattern);
+    if (asJson) {
+      printJson(payload);
+    } else {
+      printRouteDetails(name, pattern);
+    }
+    return payload;
+  }
+
+  @Command({ name: "add", description: "Add a route to an instance" })
+  add(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Arg("pattern", { description: "Route pattern (e.g., group:123456, 5511*, thread:*, *)" }) pattern: string,
+    @Arg("agent", { description: "Agent ID" }) agent: string,
+    @Option({ flags: "--priority <n>", description: "Route priority (default: 0)" }) priority?: string,
+    @Option({ flags: "--policy <policy>", description: "Policy override: open|pairing|closed|allowlist" })
+    policy?: string,
+    @Option({ flags: "--session <name>", description: "Force session name" }) session?: string,
+    @Option({ flags: "--dm-scope <scope>", description: "DM scope override" }) dmScope?: string,
+    @Option({
+      flags: "--channel <channel>",
+      description: "Limit route to a specific channel (e.g. whatsapp, telegram). Omit for all channels.",
+    })
+    channel?: string,
+    @Option({
+      flags: "--allow-runtime-mismatch",
+      description: "Allow mutation even when the CLI bundle differs from the live daemon runtime",
+    })
+    allowRuntimeMismatch?: boolean,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    if (!dbGetInstance(name)) fail(`Instance not found: ${name}. Create with: otto instances create ${name}`);
+    if (!dbGetAgent(agent))
+      fail(
+        `Agent not found: ${agent}. Available: ${dbListAgents()
+          .map((a) => a.id)
+          .join(", ")}`,
+      );
+    if (dmScope) {
+      const r = DmScopeSchema.safeParse(dmScope);
+      if (!r.success) fail(`Invalid dmScope: ${dmScope}. Valid: ${DmScopeSchema.options.join(", ")}`);
+    }
+    const pri = priority !== undefined ? parseInt(priority, 10) : 0;
+    if (Number.isNaN(pri)) fail(`Invalid priority: ${priority}`);
+    assertInstanceMutationRuntime(name, allowRuntimeMismatch);
+
+    try {
+      const route = dbCreateRoute({
+        pattern,
+        accountId: name,
+        agent,
+        priority: pri,
+        policy: policy ?? undefined,
+        session: session ?? undefined,
+        dmScope: dmScope ? DmScopeSchema.parse(dmScope) : undefined,
+        channel: channel ?? undefined,
+      });
+      emitConfigChanged();
+
+      // Remove from pending if applicable
+      let removedPending = removeAccountPending(name, pattern);
+      if (!removedPending) {
+        const contact = getContact(pattern);
+        if (contact) {
+          for (const id of contact.identities) {
+            if (removeAccountPending(name, id.value)) {
+              removedPending = true;
+              break;
+            }
+          }
+        }
+      }
+
+      // Clean conflicting sessions
+      const cleaned = deleteConflictingSessions(pattern, agent, { silent: Boolean(asJson) });
+
+      const payload = {
+        status: "added" as const,
+        instance: name,
+        route,
+        target: inspectCliRuntimeTarget(name),
+        liveEffect: getRouteLiveEffect(name, pattern, agent, channel),
+        removedPending,
+        cleanedSessions: cleaned,
+        changedCount: 1,
+      };
+      if (asJson) {
+        printJson(payload);
+      } else {
+        printInstanceMutationTarget(name);
+        const policyLabel = policy ? ` [policy:${policy}]` : "";
+        const channelLabel = channel ? ` [channel:${channel}]` : "";
+        console.log(`✓ Route added: ${pattern} → ${agent} (instance: ${name})${policyLabel}${channelLabel}`);
+        printRouteLiveEffect(name, pattern, agent, channel);
+        if (removedPending) console.log(`✓ Removed from pending`);
+        if (cleaned > 0) console.log(`✓ Cleaned ${cleaned} conflicting session(s)`);
+      }
+      return payload;
+    } catch (err) {
+      fail(`Error: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  @Command({ name: "remove", description: "Remove a route (soft-delete, recoverable)" })
+  remove(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Arg("pattern", { description: "Route pattern" }) pattern: string,
+    @Option({
+      flags: "--allow-runtime-mismatch",
+      description: "Allow mutation even when the CLI bundle differs from the live daemon runtime",
+    })
+    allowRuntimeMismatch?: boolean,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    if (!dbGetInstance(name)) fail(`Instance not found: ${name}`);
+    assertInstanceMutationRuntime(name, allowRuntimeMismatch);
+    const route = dbGetRoute(pattern, name);
+    const deleted = dbDeleteRoute(pattern, name);
+    if (deleted) {
+      const payload = {
+        status: "removed" as const,
+        instance: name,
+        pattern,
+        route,
+        target: inspectCliRuntimeTarget(name),
+        changedCount: 1,
+      };
+      if (asJson) {
+        printJson(payload);
+      } else {
+        printInstanceMutationTarget(name);
+        console.log(
+          `✓ Route removed: ${pattern} (instance: ${name}) — restore with: otto instances routes restore ${name} "${pattern}"`,
+        );
+      }
+      emitConfigChanged();
+      return payload;
+    } else {
+      fail(`Route not found: ${pattern} (instance: ${name})`);
+    }
+  }
+
+  @Command({ name: "restore", description: "Restore a soft-deleted route" })
+  restore(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Arg("pattern", { description: "Route pattern" }) pattern: string,
+    @Option({
+      flags: "--allow-runtime-mismatch",
+      description: "Allow mutation even when the CLI bundle differs from the live daemon runtime",
+    })
+    allowRuntimeMismatch?: boolean,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    assertInstanceMutationRuntime(name, allowRuntimeMismatch);
+    const ok = dbRestoreRoute(pattern, name);
+    if (ok) {
+      const payload = {
+        status: "restored" as const,
+        instance: name,
+        pattern,
+        route: dbGetRoute(pattern, name),
+        target: inspectCliRuntimeTarget(name),
+        changedCount: 1,
+      };
+      if (asJson) {
+        printJson(payload);
+      } else {
+        printInstanceMutationTarget(name);
+        console.log(`✓ Route restored: ${pattern} (instance: ${name})`);
+      }
+      emitConfigChanged();
+      return payload;
+    } else {
+      fail(`Route not found in deleted records: ${pattern} (instance: ${name})`);
+    }
+  }
+
+  @Command({ name: "deleted", description: "List soft-deleted routes" })
+  deleted(
+    @Arg("name", { description: "Instance name (omit for all)", required: false }) name?: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    const routes = dbListDeletedRoutes(name);
+    const payload = {
+      instance: name ?? null,
+      total: routes.length,
+      routes,
+    };
+    if (asJson) {
+      printJson(payload);
+    } else if (routes.length === 0) {
+      console.log("No deleted routes.");
+    } else {
+      console.log("\nDeleted Routes:\n");
+      for (const r of routes) {
+        console.log(`  ${r.accountId.padEnd(16)} ${r.pattern.padEnd(24)} → ${r.agent}`);
+      }
+      console.log(`\nRestore with: otto instances routes restore <instance> "<pattern>"`);
+    }
+    return payload;
+  }
+
+  @Command({ name: "set", description: "Set a route property" })
+  set(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Arg("pattern", { description: "Route pattern" }) pattern: string,
+    @Arg("key", { description: `Property key (${ROUTE_SETTABLE_KEYS.join(", ")})` }) key: string,
+    @Arg("value", { description: "Property value (use '-' to clear)" }) value: string,
+    @Option({
+      flags: "--allow-runtime-mismatch",
+      description: "Allow mutation even when the CLI bundle differs from the live daemon runtime",
+    })
+    allowRuntimeMismatch?: boolean,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    if (!dbGetInstance(name)) fail(`Instance not found: ${name}`);
+    if (!dbGetRoute(pattern, name)) fail(`Route not found: ${pattern} (instance: ${name})`);
+    if (!ROUTE_SETTABLE_KEYS.includes(key as (typeof ROUTE_SETTABLE_KEYS)[number])) {
+      fail(`Invalid key: ${key}. Valid keys: ${ROUTE_SETTABLE_KEYS.join(", ")}`);
+    }
+
+    const clear = value === "-" || value === "null";
+    const updates: Record<string, unknown> = {};
+    let jsonValue: unknown = clear ? null : value;
+
+    if (key === "agent") {
+      if (!dbGetAgent(value)) fail(`Agent not found: ${value}`);
+      updates.agent = value;
+    } else if (key === "priority") {
+      const n = parseInt(value, 10);
+      if (Number.isNaN(n)) fail(`Invalid priority: ${value}`);
+      updates.priority = n;
+      jsonValue = n;
+    } else if (key === "dmScope") {
+      if (!clear) {
+        const r = DmScopeSchema.safeParse(value);
+        if (!r.success) fail(`Invalid dmScope: ${value}. Valid: ${DmScopeSchema.options.join(", ")}`);
+      }
+      updates.dmScope = clear ? null : value;
+    } else if (key === "session") {
+      updates.session = clear ? null : value;
+    } else if (key === "policy") {
+      updates.policy = clear ? null : value;
+    } else if (key === "channel") {
+      updates.channel = clear ? null : value;
+    }
+    assertInstanceMutationRuntime(name, allowRuntimeMismatch);
+
+    try {
+      const route = dbUpdateRoute(pattern, updates, name);
+      emitConfigChanged();
+
+      let cleaned = 0;
+      if (key === "agent") {
+        cleaned = deleteConflictingSessions(pattern, value, { silent: Boolean(asJson) });
+      }
+
+      const payload = {
+        status: "updated" as const,
+        instance: name,
+        pattern,
+        key,
+        value: jsonValue,
+        route,
+        target: inspectCliRuntimeTarget(name),
+        liveEffect: key === "agent" && !clear ? getRouteLiveEffect(name, pattern, value, undefined) : null,
+        cleanedSessions: cleaned,
+        changedCount: 1,
+      };
+      if (asJson) {
+        printJson(payload);
+      } else {
+        printInstanceMutationTarget(name);
+        console.log(`✓ ${key} set on route ${pattern} (instance: ${name}): ${clear ? "(cleared)" : value}`);
+        if (key === "agent" && !clear) {
+          printRouteLiveEffect(name, pattern, value, undefined);
+        }
+        if (cleaned > 0) console.log(`✓ Cleaned ${cleaned} conflicting session(s)`);
+      }
+      return payload;
+    } catch (err) {
+      fail(`Error: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+}
+
+// ============================================================================
+// instances.pending subgroup
+// ============================================================================
+
+@Group({
+  name: "instances.pending",
+  description: "Manage pending contact and chat review for an instance",
+  scope: "admin",
+})
+export class InstancesPendingCommands {
+  @Command({ name: "list", description: "List pending contacts and chats for an instance" })
+  list(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+    @Option({ flags: "--limit <n>", description: "Page size (default: 50, max: 500)" }) limit?: string,
+    @Option({ flags: "--offset <n>", description: "Number of matching pending entries to skip (default: 0)" })
+    offset?: string,
+  ) {
+    if (!dbGetInstance(name)) fail(`Instance not found: ${name}`);
+    const pending = listAccountPending(name);
+    const page = paginateCliItems(pending, { limit, offset });
+    const pagination = buildCliOffsetPagination({
+      baseCommand: ["otto", "instances", "pending", "list", name],
+      limit: page.limit,
+      offset: page.offset,
+      returned: page.items.length,
+      total: page.total,
+    });
+    const pendingContacts = page.items.filter((entry) => entry.pendingKind === "contact");
+    const pendingChats = page.items.filter((entry) => entry.pendingKind === "chat");
+    const allPendingContacts = pending.filter((entry) => entry.pendingKind === "contact");
+    const allPendingChats = pending.filter((entry) => entry.pendingKind === "chat");
+
+    const payload = {
+      instance: name,
+      total: page.total,
+      pagination,
+      counts: {
+        contacts: allPendingContacts.length,
+        chats: allPendingChats.length,
+      },
+      contacts: pendingContacts.map((p) => ({
+        ...p,
+        type: p.chatType,
+      })),
+      chats: pendingChats.map((p) => ({
+        ...p,
+        type: p.chatType,
+        routePattern: normalizePendingChatPattern(p),
+      })),
+      items: page.items.map((p) => ({
+        ...p,
+        type: p.chatType,
+        ...(p.pendingKind === "chat" ? { routePattern: normalizePendingChatPattern(p) } : {}),
+      })),
+      pending: page.items.map((p) => ({
+        ...p,
+        type: p.chatType,
+        ...(p.pendingKind === "chat" ? { routePattern: normalizePendingChatPattern(p) } : {}),
+      })),
+    };
+
+    if (asJson) {
+      printJson(payload);
+    } else if (page.items.length === 0) {
+      console.log(`No pending contacts or chats for instance "${name}".`);
+    } else {
+      if (pendingContacts.length > 0) {
+        console.log(`\nPending contacts for: ${name}\n`);
+        console.log("  ID                                       TYPE    NAME");
+        console.log("  ---------------------------------------  ------  --------------------");
+        for (const p of pendingContacts as AccountPendingEntry[]) {
+          console.log(`  ${p.phone.padEnd(39)}  ${p.chatType.padEnd(6)}  ${p.name ?? "-"}`);
+        }
+      }
+
+      if (pendingChats.length > 0) {
+        console.log(`\nPending chats for: ${name}\n`);
+        console.log("  ROUTE PATTERN                            TYPE    NAME");
+        console.log("  ---------------------------------------  ------  --------------------");
+        for (const p of pendingChats as AccountPendingEntry[]) {
+          const pattern = normalizePendingChatPattern(p);
+          console.log(`  ${pattern.padEnd(39)}  ${p.chatType.padEnd(6)}  ${p.name ?? "-"}`);
+        }
+      }
+      console.log(
+        `\n  Total: ${page.total} (${page.items.length} returned, limit ${page.limit}, offset ${page.offset})`,
+      );
+      if (pagination.nextCommand) {
+        console.log("\n  Next page:");
+        console.log(`    ${pagination.nextCommand}`);
+      }
+      console.log(`\n  Approve contact: otto instances pending approve ${name} <phone>`);
+      console.log(`  Approve chat:    otto instances pending approve ${name} <chat> --agent <agent>`);
+    }
+    return payload;
+  }
+
+  @Command({ name: "approve", description: "Approve a pending contact or chat" })
+  approve(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Arg("contact", { description: "Contact identity or chat route pattern" }) contact: string,
+    @Option({ flags: "--agent <id>", description: "Agent to route an approved chat to" }) agent?: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    const instance = dbGetInstance(name);
+    if (!instance) fail(`Instance not found: ${name}`);
+    const pending = findPendingReviewEntry(name, contact);
+    const normalizedContact = normalizePhone(contact);
+    const isChatApproval = pending?.pendingKind === "chat" || normalizedContact.startsWith("group:");
+
+    if (isChatApproval) {
+      const routeAgent = agent ?? instance.agent;
+      if (!routeAgent) {
+        fail("Approving a pending chat requires --agent because the instance has no default agent.");
+      }
+      if (!dbGetAgent(routeAgent)) {
+        fail(
+          `Agent not found: ${routeAgent}. Available: ${dbListAgents()
+            .map((a) => a.id)
+            .join(", ")}`,
+        );
+      }
+      const routePattern = pending ? normalizePendingChatPattern(pending) : normalizedContact;
+      let route = dbGetRoute(routePattern, name);
+      let routeCreated = false;
+      if (!route) {
+        dbCreateRoute({
+          pattern: routePattern,
+          accountId: name,
+          agent: routeAgent,
+          priority: 0,
+          channel: instance.channel,
+        });
+        route = dbGetRoute(routePattern, name);
+        if (!route) fail(`Created route could not be loaded: ${routePattern} (instance: ${name})`);
+        routeCreated = true;
+      }
+      const removedPending = pending ? removeAccountPending(name, pending.phone) : removeAccountPending(name, contact);
+      emitConfigChanged();
+      const payload = {
+        status: "approved" as const,
+        reviewKind: "chat" as const,
+        instance: name,
+        chat: contact,
+        routePattern,
+        route,
+        routeCreated,
+        removedPending,
+        changedCount: routeCreated || removedPending ? 1 : 0,
+      };
+      if (asJson) {
+        printJson(payload);
+      } else {
+        console.log(`✓ Chat approved: ${routePattern} → ${routeAgent} (instance: ${name})`);
+        if (removedPending) console.log(`✓ Removed from pending`);
+      }
+      return payload;
+    }
+
+    allowContact(contact);
+    const removedPending = pending ? removeAccountPending(name, pending.phone) : removeAccountPending(name, contact);
+    const payload = {
+      status: "approved" as const,
+      reviewKind: "contact" as const,
+      instance: name,
+      contact,
+      removedPending,
+      changedCount: 1,
+    };
+    if (asJson) {
+      printJson(payload);
+    } else {
+      console.log(`✓ Approved: ${contact} (instance: ${name})`);
+    }
+    emitConfigChanged();
+    return payload;
+  }
+
+  @Command({ name: "reject", description: "Reject and remove a pending contact or chat" })
+  reject(
+    @Arg("name", { description: "Instance name" }) name: string,
+    @Arg("contact", { description: "Contact identity or chat route pattern" }) contact: string,
+    @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
+  ) {
+    if (!dbGetInstance(name)) fail(`Instance not found: ${name}`);
+    const pending = findPendingReviewEntry(name, contact);
+    const removed = pending ? removeAccountPending(name, pending.phone) : removeAccountPending(name, contact);
+    if (removed) {
+      const payload = {
+        status: "rejected" as const,
+        reviewKind: pending?.pendingKind ?? "unknown",
+        instance: name,
+        contact,
+        removedPending: true,
+        changedCount: 1,
+      };
+      if (asJson) {
+        printJson(payload);
+      } else {
+        console.log(`✓ Rejected and removed: ${contact} (instance: ${name})`);
+      }
+      return payload;
+    } else {
+      fail(`Pending entry not found: ${contact} (instance: ${name})`);
+    }
+  }
+}

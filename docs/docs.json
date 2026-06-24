@@ -1,0 +1,126 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "Otto",
+  "description": "The daemon that gives Claude a life",
+  "theme": "mint",
+  "colors": {
+    "primary": "#06B6D4",
+    "dark": "#0891B2",
+    "light": "#22D3EE"
+  },
+  "font": {
+    "body": "Fragment Mono",
+    "heading": "DM Sans"
+  },
+    "logo": {
+    "light": "/logo-light.svg",
+    "dark": "/logo-dark.svg"
+  },
+  "favicon": "/favicon.png",
+  "cname": "docs.otto.bot",
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/moraisdev/otto"
+      }
+    ]
+  },
+  "icons": {
+    "style": "lucide",
+    "library": "lucide"
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Get Started",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": ["index", "start/quickstart", "start/configuration"]
+          }
+        ]
+      },
+      {
+        "tab": "CLI",
+        "groups": [
+          {
+            "group": "CLI Reference",
+            "pages": ["cli/overview"]
+          }
+        ]
+      },
+      {
+        "tab": "Guides",
+        "groups": [
+          {
+            "group": "Messaging",
+            "pages": [
+              "guides/contacts",
+              "guides/sessions",
+              "guides/instances",
+              "guides/whatsapp-groups"
+            ]
+          },
+          {
+            "group": "Automation",
+            "pages": [
+              "guides/cron-jobs",
+              "guides/triggers"
+            ]
+          },
+          {
+            "group": "Security",
+            "pages": [
+              "guides/permissions"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "guides/sdk",
+              "guides/copilot"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "guides/nats-debugging",
+              "guides/development"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Features",
+            "pages": ["features/overview"]
+          },
+          {
+            "group": "Architecture",
+            "pages": ["architecture"]
+          },
+          {
+            "group": "NATS",
+            "pages": ["reference/nats-events"]
+          },
+          {
+            "group": "Tools",
+            "pages": ["reference/media", "reference/artifacts", "reference/skills"]
+          }
+        ]
+      },
+      {
+        "tab": "API",
+        "groups": [
+          {
+            "group": "API reference",
+            "openapi": "openapi.json"
+          }
+        ]
+      }
+    ]
+  }
+}

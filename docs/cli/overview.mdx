@@ -1,0 +1,447 @@
+---
+title: CLI Reference
+description: Complete command reference for the otto CLI — all groups, subcommands, arguments, and options extracted from source.
+---
+
+## Output Contract
+
+`stdout` is reserved for the command payload only.
+
+- Human-readable command results and `--json` payloads are written to `stdout`.
+- User-facing CLI commands suppress infrastructure `INFO/WARN/DEBUG` logs by default.
+- When explicitly enabled for diagnosis, infrastructure logs and internal diagnostics go to `stderr`.
+- Set `OTTO_CLI_LOG_LEVEL=info` to opt into verbose CLI diagnostics temporarily.
+- Machine-readable modes like `otto stream` also reserve `stdout` for protocol frames only.
+
+## Setup
+
+```bash
+otto setup                                    # Interactive setup wizard (omni, env, agent, settings, daemon)
+```
+
+## Daemon
+
+Manage the otto daemon process via PM2.
+
+```bash
+otto daemon start                             # Start daemon via PM2
+otto daemon stop                              # Stop daemon
+otto daemon restart -m "reason"               # Restart daemon with required reason
+otto daemon restart --build -m "reason"       # Build before restarting
+otto daemon status                            # Show daemon + infra status (otto, omni-nats, omni-api)
+otto daemon logs                              # Show last 50 lines
+otto daemon logs -f                           # Follow log output
+otto daemon logs -t 100                       # Show last 100 lines
+otto daemon logs --clear                      # Flush PM2 logs
+otto daemon logs --path                       # Print PM2 log file path
+otto daemon env                               # Edit ~/.otto/.env in $EDITOR
+otto daemon install                           # Save PM2 process list (pm2 save + startup hint)
+otto daemon uninstall                         # Remove otto from PM2
+otto daemon run                               # Run daemon in foreground (used by PM2 internally)
+otto daemon dev                               # Dev mode — watch src/ and auto-rebuild on changes
+```
+
+## Agents
+
+Agent lifecycle and configuration.
+
+```bash
+otto agents list                              # List all agents
+otto agents show <id>                         # Show agent details (model, mode, permissions, defaults)
+otto agents create <id> <cwd>                 # Create a new agent
+otto agents delete <id>                       # Delete an agent
+otto agents set <id> <key> <value>            # Set property (name, cwd, model, dmScope, mode, defaults, ...)
+otto agents debounce <id> [ms]                # Set/show message debounce (0 to disable)
+otto agents spec-mode <id> [true|false]       # Enable/disable spec mode
+otto agents session <id>                      # Show all sessions for agent
+otto agents reset <id> [nameOrKey|all]        # Reset session (omit for main, "all" for all sessions)
+otto agents debug <id> [nameOrKey] [-n count] # Show last N turns of a session transcript
+```
+
+**Agent `set` keys:** `name`, `cwd`, `model`, `dmScope`, `systemPromptAppend`, `matrixAccount`, `settingSources`, `mode` (active|sentinel), `groupDebounceMs`, `defaults` (JSON object).
+
+## Instances
+
+Central configuration entity for channels/accounts. Each instance maps to one omni connection.
+
+```bash
+otto instances list                           # List all instances with status
+otto instances show <name>                    # Show instance details + routes
+otto instances create <name>                  # Create instance
+  --channel <channel>                         #   Channel type (default: whatsapp)
+  --agent <id>                                #   Default agent
+  --dm-policy <open|pairing|closed>           #   DM policy (default: open)
+  --group-policy <open|allowlist|closed>      #   Group policy (default: open)
+otto instances get <name> <key>               # Get instance property
+otto instances set <name> <key> <value>       # Set instance property (agent, dmPolicy, groupPolicy, dmScope, instanceId, channel)
+otto instances delete <name>                  # Soft-delete instance
+otto instances restore <name>                 # Restore soft-deleted instance
+otto instances deleted                        # List soft-deleted instances
+otto instances connect <name>                 # Connect to omni (QR code for WhatsApp)
+  --channel <channel>                         #   Channel type
+  --agent <id>                                #   Agent to route messages to
+otto instances disconnect <name>              # Disconnect from omni
+otto instances status <name>                  # Show connection status
+```
+
+## Routes
+
+Read route config and live routing without drilling into the `instances` subtree.
+
+```bash
+otto routes list [name]                       # List routes across all instances or for one instance
+otto routes show <name> <pattern>             # Show route details
+otto routes explain <name> <pattern>          # Explain config vs live route winner
+  --channel <channel>                         #   Optional channel hint for live route inspection
+```
+
+Use `otto instances routes ...` when you need to mutate route config.
+
+### Instance Routes
+
+Per-instance routing rules that map patterns to agents. Use this subtree for mutations; use `otto routes ...` for discovery/read paths.
+
+```bash
+otto instances routes list <name>             # List routes for instance
+otto instances routes show <name> <pattern>   # Show route details
+otto instances routes add <name> <pattern> <agent>  # Add route
+  --priority <n>                              #   Route priority (default: 0)
+  --policy <open|pairing|closed|allowlist>    #   Policy override
+  --session <name>                            #   Force session name
+  --dm-scope <scope>                          #   DM scope override
+  --channel <channel>                         #   Limit to specific channel
+otto instances routes remove <name> <pattern> # Soft-delete route
+otto instances routes restore <name> <pattern># Restore soft-deleted route
+otto instances routes deleted [name]          # List soft-deleted routes
+otto instances routes set <name> <pattern> <key> <value>  # Set route property (agent, priority, dmScope, session, policy, channel)
+```
+
+### Instance Pending
+
+Manage unrouted contacts/groups waiting for approval.
+
+```bash
+otto instances pending list <name>            # List pending contacts/groups
+otto instances pending approve <name> <contact>  # Approve pending contact
+otto instances pending reject <name> <contact>   # Reject and remove pending contact
+```
+
+## Contacts
+
+Contact management with multi-platform identities.
+
+```bash
+otto contacts list [--status <status>]        # List all contacts (filter by status)
+otto contacts pending [-a <account>]          # List pending contacts (global + per-account)
+otto contacts add <identity> [name]           # Add/allow a contact (phone, LID, or group ID)
+  --agent <ids>                               #   Restrict to agent(s), comma-separated
+otto contacts approve <contact> [mode]        # Approve pending contact (mode: auto|mention)
+  --agent <ids>                               #   Restrict to agent(s)
+otto contacts remove <contact>                # Remove a contact
+otto contacts allow <contact>                 # Allow a contact
+otto contacts block <contact>                 # Block a contact
+otto contacts info <contact>                  # Show contact details with all identities
+otto contacts check <contact>                 # Alias for info
+otto contacts find <query> [--tag]            # Search by name/phone or by tag
+otto contacts set <contact> <key> <value>     # Set property (mode, email, name, tags, notes, opt-out, source, allowed-agents)
+otto contacts tag <contact> <tag>             # Add tag
+otto contacts untag <contact> <tag>           # Remove tag
+otto contacts group-tag <contact> <group> <tag>    # Set tag in a specific group
+otto contacts group-untag <contact> <group>        # Remove tag from a specific group
+otto contacts identity-add <contact> <platform> <value>  # Add identity (phone, whatsapp_lid, whatsapp_group, matrix, telegram)
+otto contacts identity-remove <platform> <value>         # Remove identity
+otto contacts merge <source> <target>         # Merge contacts (move identities, delete source)
+```
+
+## Sessions
+
+Manage agent sessions, cross-session messaging, and ephemeral TTLs.
+
+```bash
+otto sessions list [--agent <id>] [--ephemeral]  # List sessions
+otto sessions info <nameOrKey>                    # Show session details
+otto sessions rename <nameOrKey> <displayName>    # Set display name
+otto sessions set-model <nameOrKey> <model>       # Set model override (sonnet, opus, haiku, clear)
+otto sessions set-thinking <nameOrKey> <level>    # Set thinking level (off, normal, verbose, clear)
+otto sessions reset <nameOrKey>                   # Reset session (fresh start)
+otto sessions delete <nameOrKey>                  # Delete session permanently
+otto sessions read <nameOrKey> [-n count]         # Read message history (default: 20)
+```
+
+### Ephemeral Sessions
+
+```bash
+otto sessions set-ttl <nameOrKey> <duration>      # Make session ephemeral (e.g. 5h, 30m, 1d)
+otto sessions extend <nameOrKey> [duration]       # Extend TTL (default: 5h)
+otto sessions keep <nameOrKey>                    # Make ephemeral session permanent
+```
+
+### Cross-Session Messaging
+
+```bash
+otto sessions send <nameOrKey> [prompt]           # Send prompt (fire-and-forget)
+  -w, --wait                                      #   Wait for and stream response
+  -i, --interactive                               #   Interactive chat mode
+  -a, --agent <id>                                #   Agent for creating new session
+  --channel <channel>                             #   Override delivery channel
+  --to <chatId>                                   #   Override delivery target
+otto sessions ask <target> <message> [sender]     # Ask a question to another session
+otto sessions answer <target> <message> [sender]  # Answer a question from another session
+otto sessions execute <target> <message>          # Send execute command to another session
+otto sessions inform <target> <message>           # Send informational message to another session
+```
+
+## Settings
+
+Global configuration stored in SQLite.
+
+```bash
+otto settings list                            # List live settings; legacy account.* is hidden by default
+otto settings list --legacy                   # Inspect legacy account.* rows shadowed by instances
+otto settings get <key>                       # Get a setting value
+otto settings set <key> <value>               # Set a setting value
+otto settings delete <key>                    # Delete a setting
+```
+
+**Known settings:** `defaultAgent`, `defaultDmScope`, `defaultTimezone`, `whatsapp.groupPolicy`, `whatsapp.dmPolicy`. Legacy `account.*` rows are shadowed by `instances` and should not be used as live config.
+
+## Permissions
+
+REBAC (Relation-Based Access Control) permission management.
+
+```bash
+otto permissions grant <subject> <relation> <object>   # Grant a relation
+otto permissions revoke <subject> <relation> <object>  # Revoke a relation
+otto permissions check <subject> <permission> <object> # Check if allowed
+otto permissions list                                  # List all relations
+  --subject <s>                                        #   Filter by subject
+  --object <o>                                         #   Filter by object
+  --relation <r>                                       #   Filter by relation
+  --source <src>                                       #   Filter by source (config|manual)
+otto permissions init <subject> <template>             # Apply template (sdk-tools, all-tools, safe-executables, full-access, tool-groups)
+otto permissions sync                                  # Re-sync relations from agent configs
+otto permissions clear [--all]                         # Clear manual relations (--all includes config)
+```
+
+**Entity format:** `type:id` (e.g. `agent:dev`, `tool:Bash`, `group:contacts`, `system:*`).
+
+**Relations:** `admin`, `use`, `execute`, `access`, `modify`, `write_contacts`, `read_own_contacts`, `read_tagged_contacts`, `read_contact`, `view`.
+
+**Entity types:** `agent`, `system`, `group`, `session`, `contact`, `cron`, `trigger`, `team`, `tool`, `executable`, `toolgroup`.
+
+## Cron
+
+Scheduled job management.
+
+```bash
+otto cron list                                # List all jobs
+otto cron show <id>                           # Show job details
+otto cron add <name>                          # Add a new job
+  --cron <expr>                               #   Cron expression (e.g. "0 9 * * *")
+  --every <interval>                          #   Interval (e.g. 30m, 1h)
+  --at <datetime>                             #   One-shot ISO datetime
+  --tz <timezone>                             #   Timezone (for --cron)
+  --message <text>                            #   Prompt message (required)
+  --agent <id>                                #   Target agent
+  --account <name>                            #   Account for channel delivery
+  --isolated                                  #   Run in isolated session
+  --delete-after                              #   Delete job after first run
+  --description <text>                        #   Job description
+otto cron enable <id>                         # Enable a job
+otto cron disable <id>                        # Disable a job
+otto cron set <id> <key> <value>              # Set property (name, message, cron, every, tz, agent, account, description, session, reply-session, delete-after)
+otto cron run <id>                            # Manually trigger a job
+otto cron rm <id>                             # Delete a job
+```
+
+## Heartbeat
+
+Proactive agent runs that check HEARTBEAT.md for pending tasks.
+
+```bash
+otto heartbeat status                         # Show status for all agents
+otto heartbeat show <id>                      # Show config for an agent
+otto heartbeat enable <id> [interval]         # Enable heartbeat (e.g. 30m, 1h)
+otto heartbeat disable <id>                   # Disable heartbeat
+otto heartbeat set <id> <key> <value>         # Set property (interval, model, account, active-hours)
+otto heartbeat trigger <id>                   # Manually trigger heartbeat
+```
+
+## Triggers
+
+Event-driven triggers that subscribe to NATS topics and fire agent prompts.
+
+```bash
+otto triggers list                            # List all triggers
+otto triggers show <id>                       # Show trigger details
+otto triggers add <name>                      # Add a new trigger
+  --topic <pattern>                           #   NATS topic pattern (required)
+  --message <text>                            #   Prompt message (required)
+  --agent <id>                                #   Target agent
+  --account <name>                            #   Account for channel delivery
+  --cooldown <duration>                       #   Cooldown between fires (default: 5s)
+  --session <main|isolated>                   #   Session type (default: isolated)
+  --filter <expression>                       #   Filter expression
+otto triggers enable <id>                     # Enable trigger
+otto triggers disable <id>                    # Disable trigger
+otto triggers set <id> <key> <value>          # Set property (name, message, topic, agent, account, session, cooldown, filter)
+otto triggers test <id>                       # Test with fake event data
+otto triggers rm <id>                         # Delete trigger
+```
+
+## WhatsApp Groups
+
+WhatsApp group management (requires connected instance).
+
+```bash
+otto whatsapp.group list [--account <id>]                    # List all groups
+otto whatsapp.group info <groupId> [--account <id>]          # Show group metadata + participants
+otto whatsapp.group create <name> <participants>             # Create group (comma-separated phones)
+  --account <id>                                             #   WhatsApp account
+  --agent <id>                                               #   Auto-route to agent
+otto whatsapp.group add <groupId> <participants>             # Add participants
+otto whatsapp.group remove <groupId> <participants>          # Remove participants
+otto whatsapp.group promote <groupId> <participants>         # Promote to admin
+otto whatsapp.group demote <groupId> <participants>          # Demote from admin
+otto whatsapp.group invite <groupId>                         # Get invite link
+otto whatsapp.group revoke-invite <groupId>                  # Revoke invite link
+otto whatsapp.group join <code>                              # Join group via invite
+otto whatsapp.group leave <groupId>                          # Leave group
+otto whatsapp.group rename <groupId> <name>                  # Rename group
+otto whatsapp.group description <groupId> <text>             # Update description
+otto whatsapp.group settings <groupId> <setting>             # Update settings (announcement, not_announcement, locked, unlocked)
+```
+
+## WhatsApp DMs
+
+Send direct messages and manage read receipts.
+
+```bash
+otto whatsapp.dm send <contact> <message>     # Send a DM (resolves LID or phone)
+  --account <id>                              #   WhatsApp account
+otto whatsapp.dm read <contact>               # Read recent messages
+  --last <n>                                  #   Number of messages (default: 10)
+  --no-ack                                    #   Don't send read receipt
+  --account <id>                              #   WhatsApp account
+otto whatsapp.dm ack <contact> <messageId>    # Send read receipt for specific message
+  --account <id>                              #   WhatsApp account
+```
+
+## Media
+
+Send media files through connected channels.
+
+```bash
+otto media send <filePath>                    # Send media file (image, video, audio, document)
+  --caption <text>                            #   Caption for media
+  --channel <channel>                         #   Target channel
+  --to <chatId>                               #   Target chat ID
+  --account <id>                              #   Account ID
+  --ptt                                       #   Send audio as voice note (PTT)
+```
+
+## Audio
+
+Generate speech via ElevenLabs TTS.
+
+```bash
+otto audio generate <text>                    # Generate speech from text
+  --voice <id>                                #   ElevenLabs voice ID
+  --model <model>                             #   TTS model (eleven_multilingual_v2, eleven_turbo_v2_5, etc.)
+  --speed <0.5-2.0>                           #   Speech speed (default: 1.0)
+  --lang <code>                               #   Language code (default: pt-br)
+  --format <format>                           #   Output format (mp3_44100_128, mp3_22050_32, pcm_16000)
+  -o, --output <path>                         #   Output directory (default: /tmp)
+  --send                                      #   Auto-send to current chat
+  --caption <text>                            #   Caption when sending
+```
+
+## Image
+
+Generate images via Gemini.
+
+```bash
+otto image generate <prompt>                  # Generate image from text prompt
+  --mode <fast|quality>                       #   Model: fast (Flash) or quality (Pro). Default: fast
+  --source <path>                             #   Source image for editing/reference
+  -o, --output <path>                         #   Output directory (default: /tmp)
+  --aspect <ratio>                            #   Aspect ratio (1:1, 2:3, 3:2, 3:4, 4:3, 9:16, 16:9, 21:9)
+  --size <1K|2K|4K>                           #   Image size (default: 1K)
+  --send                                      #   Auto-send to current chat
+  --caption <text>                            #   Caption when sending
+```
+
+## Video
+
+Analyze videos via Gemini API.
+
+```bash
+otto video analyze <url>                      # Analyze YouTube URL or local file
+  -o, --output <path>                         #   Output file path (default: auto-generated)
+  -p, --prompt <text>                         #   Custom analysis prompt
+```
+
+## Transcribe
+
+Audio transcription via OpenAI Whisper.
+
+```bash
+otto transcribe file <path>                   # Transcribe a local audio file
+  --lang <code>                               #   Language code (default: pt)
+```
+
+Supported formats: `.ogg`, `.opus`, `.mp3`, `.m4a`, `.mp4`, `.wav`, `.webm`.
+
+## React
+
+Emoji reactions on messages.
+
+```bash
+otto react send <messageId> <emoji>           # Send emoji reaction (messageId from [mid:ID] tags)
+```
+
+## Events
+
+Live stream of NATS events for debugging.
+
+```bash
+otto events stream                            # Stream all events in real-time
+  -f, --filter <pattern>                      #   Topic glob filter (e.g. "otto.session.*")
+  --no-claude                                 #   Hide raw Claude SDK events
+  --no-heartbeat                              #   Hide heartbeat events
+  --only <type>                               #   Only show: prompt, response, tool, claude, cli, audit
+```
+
+## Copilot
+
+Bridge otto to Claude Code team mailboxes.
+
+```bash
+otto copilot send <teamName> <message>        # Send message to a team inbox
+  --from <name>                               #   Sender name (default: otto)
+  --summary <text>                            #   Short summary title
+  --color <color>                             #   Message color
+otto copilot teams                            # List discovered Claude Code teams
+```
+
+## Tools
+
+Inspect and export CLI tools as SDK tool definitions.
+
+```bash
+otto tools list                               # List all available CLI tools (as SDK tools)
+otto tools show <name>                        # Show tool details + JSON schema
+otto tools manifest                           # Export as JSON manifest
+otto tools schema                             # Export as JSON Schema
+otto tools test <name> [argsJson]             # Test a tool execution
+```
+
+## Service
+
+Low-level bot service management.
+
+```bash
+otto service start                            # Start bot server (foreground)
+otto service tui [session]                    # Start TUI interface
+otto service wa                               # (Deprecated) Use "otto daemon start" instead
+```

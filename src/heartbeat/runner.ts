@@ -1,0 +1,411 @@
+/**
+ * Heartbeat Runner
+ *
+ * Manages per-agent heartbeat timers and tool completion triggers.
+ */
+
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { nats } from "../nats.js";
+import { publishSessionPrompt } from "../omni/session-stream.js";
+import { logger } from "../utils/logger.js";
+import { dbListAgents } from "../router/router-db.js";
+import {
+  expandHome,
+  getOrCreateSession,
+  getSessionByName,
+  generateSessionName,
+  ensureUniqueName,
+  updateSessionName,
+} from "../router/index.js";
+import { dbListLearningCandidates, dbMarkLearningProcessed, dbUpsertInsightLink } from "../insights/index.js";
+import { runLearningCycle, createProviderClassifier, sendProposal } from "../learning/index.js";
+import { createOneShotRunPrompt } from "../learning/run-prompt.js";
+import { isWithinActiveHours, updateAgentHeartbeatLastRun, HEARTBEAT_PROMPT } from "./config.js";
+
+const log = logger.child("heartbeat");
+
+/**
+ * Run the learning cycle for a single agent in batch.
+ * Reads unprocessed learning candidates, classifies them, applies
+ * memory/knowledge to the agent workspace, and records lineage back
+ * to the insights DB. Must never throw to the caller.
+ */
+/**
+ * Resolve the agent's main session name (matching bot.ts/triggerHeartbeat
+ * convention) so learning proposals can be delivered through the same channel
+ * the heartbeat uses to reach the user.
+ */
+function resolveMainSessionName(agentId: string): string {
+  const baseName = generateSessionName(agentId, { isMain: true });
+  const existing = getSessionByName(baseName);
+  return existing?.name ?? baseName;
+}
+
+/**
+ * Build a proposal sender that delivers a staged skill/command proposal to the
+ * agent's channel by injecting it as a prompt into the agent's main session —
+ * the same delivery mechanism `triggerHeartbeat` uses for heartbeat output.
+ */
+function buildProposalSender(agentId: string): (message: string) => Promise<void> {
+  return async (message: string) => {
+    const sessionName = resolveMainSessionName(agentId);
+    await publishSessionPrompt(sessionName, {
+      prompt: `[System] Inform: ${message}`,
+      _agentId: agentId,
+    });
+  };
+}
+
+async function runAgentLearning(agent: { id: string; cwd: string }): Promise<void> {
+  const candidates = dbListLearningCandidates({ limit: 25, agentId: agent.id }).map((c) => ({
+    id: c.id,
+    summary: c.summary,
+    detail: c.detail,
+  }));
+  if (candidates.length === 0) return;
+
+  const candidateIds = new Set(candidates.map((c) => c.id));
+  const processed = new Set<string>();
+  const proposalSender = buildProposalSender(agent.id);
+
+  const result = await runLearningCycle({
+    cwd: expandHome(agent.cwd),
+    candidates,
+    classifier: createProviderClassifier({ runPrompt: createOneShotRunPrompt() }),
+    onApplied: async (d) => {
+      dbMarkLearningProcessed(d.insightId, "processed");
+      dbUpsertInsightLink({
+        insightId: d.insightId,
+        targetType: "agent",
+        targetId: agent.id,
+        label: `learning:${d.route}`,
+      });
+      processed.add(d.insightId);
+    },
+    onDeferred: async (d, stagedId) => {
+      dbMarkLearningProcessed(d.insightId, "processed");
+      dbUpsertInsightLink({
+        insightId: d.insightId,
+        targetType: "agent",
+        targetId: agent.id,
+        label: "skill-staged",
+      });
+      processed.add(d.insightId);
+      try {
+        await sendProposal(proposalSender, d, stagedId);
+      } catch (err) {
+        log.error("Failed to deliver learning proposal", { agentId: agent.id, stagedId, error: err });
+      }
+    },
+  });
+
+  for (const id of result.skipped) {
+    dbMarkLearningProcessed(id, "skipped");
+    processed.add(id);
+  }
+
+  // Any candidate read this cycle that the classifier did not act on (no-op,
+  // empty classifier response, or dropped decisions) is marked skipped so it
+  // leaves the 'candidate' state and does not accumulate forever.
+  for (const id of candidateIds) {
+    if (!processed.has(id)) {
+      dbMarkLearningProcessed(id, "skipped");
+    }
+  }
+}
+
+interface AgentTimer {
+  intervalTimer?: ReturnType<typeof setInterval>;
+  lastTrigger: number;
+  intervalMs: number; // Track interval to detect changes
+}
+
+/**
+ * HeartbeatRunner - manages heartbeat scheduling for all agents
+ */
+export class HeartbeatRunner {
+  private timers = new Map<string, AgentTimer>();
+  private running = false;
+
+  /**
+   * Start the heartbeat runner.
+   * Starts interval timers for enabled agents.
+   */
+  async start(): Promise<void> {
+    if (this.running) return;
+    this.running = true;
+
+    log.info("Starting heartbeat runner");
+
+    // Start interval timers for enabled agents
+    this.refreshTimers();
+
+    // Subscribe to config refresh signals
+    this.subscribeToConfigRefresh();
+
+    log.info("Heartbeat runner started");
+  }
+
+  /**
+   * Stop the heartbeat runner.
+   * Clears all timers and stops event subscriptions.
+   */
+  async stop(): Promise<void> {
+    if (!this.running) return;
+    this.running = false;
+
+    log.info("Stopping heartbeat runner");
+
+    // Clear all timers
+    for (const [agentId, timer] of this.timers) {
+      if (timer.intervalTimer) {
+        clearInterval(timer.intervalTimer);
+      }
+      log.debug("Cleared timer for agent", { agentId });
+    }
+    this.timers.clear();
+
+    log.info("Heartbeat runner stopped");
+  }
+
+  /**
+   * Refresh timers based on current agent configurations.
+   * Called on startup and can be called to reload after config changes.
+   */
+  refreshTimers(): void {
+    const agents = dbListAgents();
+
+    // Clear existing timers for agents that are no longer enabled
+    for (const [agentId, timer] of this.timers) {
+      const agent = agents.find((a) => a.id === agentId);
+      if (!agent?.heartbeat?.enabled) {
+        if (timer.intervalTimer) {
+          clearInterval(timer.intervalTimer);
+        }
+        this.timers.delete(agentId);
+        log.debug("Removed timer for disabled agent", { agentId });
+      }
+    }
+
+    // Set up timers for enabled agents
+    for (const agent of agents) {
+      if (!agent.heartbeat?.enabled) continue;
+
+      const existing = this.timers.get(agent.id);
+      const intervalMs = agent.heartbeat.intervalMs;
+
+      // Check if timer exists with same interval
+      if (existing?.intervalTimer && existing.intervalMs === intervalMs) {
+        continue; // No change needed
+      }
+
+      // Clear old timer if interval changed
+      if (existing?.intervalTimer) {
+        clearInterval(existing.intervalTimer);
+        log.info("Interval changed, recreating timer", {
+          agentId: agent.id,
+          oldInterval: existing.intervalMs,
+          newInterval: intervalMs,
+        });
+      }
+
+      const intervalTimer = setInterval(() => {
+        runAgentLearning({ id: agent.id, cwd: agent.cwd }).catch((err) => {
+          log.error("Learning cycle failed", { agentId: agent.id, error: err });
+        });
+        this.triggerHeartbeat(agent.id, "interval");
+      }, intervalMs);
+
+      this.timers.set(agent.id, {
+        ...existing,
+        intervalTimer,
+        intervalMs,
+        lastTrigger: existing?.lastTrigger ?? 0,
+      });
+
+      log.info("Started heartbeat timer", {
+        agentId: agent.id,
+        intervalMs,
+      });
+    }
+  }
+
+  /**
+   * Subscribe to config refresh signals from CLI.
+   */
+  private async subscribeToConfigRefresh(): Promise<void> {
+    const topic = "otto.heartbeat.refresh";
+    log.debug("Subscribing to config refresh", { topic });
+
+    try {
+      for await (const _event of nats.subscribe(topic)) {
+        if (!this.running) break;
+        log.info("Received heartbeat config refresh signal");
+        this.refreshTimers();
+      }
+    } catch (err) {
+      log.error("Config refresh subscription error", { error: err });
+      if (this.running) {
+        setTimeout(() => this.subscribeToConfigRefresh(), 5000);
+      }
+    }
+  }
+
+  /**
+  /**
+   * Trigger a heartbeat for an agent.
+   * Performs pre-checks and sends the heartbeat prompt.
+   */
+  async triggerHeartbeat(agentId: string, trigger: "interval" | "manual"): Promise<boolean> {
+    const agents = dbListAgents();
+    const agent = agents.find((a) => a.id === agentId);
+
+    if (!agent) {
+      log.warn("Agent not found for heartbeat", { agentId });
+      return false;
+    }
+
+    // Check if heartbeat is enabled (for manual triggers)
+    if (!agent.heartbeat?.enabled && trigger !== "manual") {
+      log.debug("Heartbeat disabled for agent", { agentId });
+      return false;
+    }
+
+    // Check active hours
+    if (agent.heartbeat && !isWithinActiveHours(agent.heartbeat)) {
+      log.debug("Outside active hours", { agentId });
+      return false;
+    }
+
+    // Check HEARTBEAT.md exists and is not empty
+    const agentCwd = expandHome(agent.cwd);
+    const heartbeatFile = join(agentCwd, "HEARTBEAT.md");
+
+    if (!existsSync(heartbeatFile)) {
+      log.debug("No HEARTBEAT.md file", { agentId, path: heartbeatFile });
+      return false;
+    }
+
+    const content = readFileSync(heartbeatFile, "utf-8").trim();
+    if (!content) {
+      log.debug("HEARTBEAT.md is empty", { agentId });
+      return false;
+    }
+
+    log.info("Triggering heartbeat", { agentId, trigger });
+
+    // Update last trigger time
+    const timer = this.timers.get(agentId);
+    const timerState = timer ?? { lastTrigger: 0, intervalMs: agent.heartbeat?.intervalMs ?? 1800000 };
+    timerState.lastTrigger = Date.now();
+    this.timers.set(agentId, timerState);
+
+    // Update last run timestamp in DB
+    updateAgentHeartbeatLastRun(agentId);
+
+    // Find or create the main session for the agent.
+    // Strategy: use the session NAME as the canonical key (same as bot.ts).
+    // This avoids a race where the bot creates a session with key=name while
+    // the runner creates one with key=agent:X:main, causing UNIQUE conflicts.
+    const baseName = generateSessionName(agentId, { isMain: true });
+
+    // Check if session already exists by name
+    let mainSession = getSessionByName(baseName);
+
+    if (mainSession) {
+      // Session exists — fix agent_id if it was created with wrong agent (race from previous bug)
+      if (mainSession.agentId !== agentId) {
+        log.info("Fixing session agent_id", {
+          sessionName: baseName,
+          oldAgent: mainSession.agentId,
+          newAgent: agentId,
+        });
+        // Re-create session entry with correct agent via getOrCreateSession
+        // (it updates agent_id if session_key matches)
+        getOrCreateSession(mainSession.sessionKey, agentId, agentCwd);
+        mainSession.agentId = agentId;
+      }
+    } else {
+      // Session doesn't exist — create it using name as key (matches bot.ts convention)
+      const sessionName = ensureUniqueName(baseName);
+      mainSession = getOrCreateSession(sessionName, agentId, agentCwd, { name: sessionName });
+      if (!mainSession.name) {
+        updateSessionName(mainSession.sessionKey, sessionName);
+        mainSession.name = sessionName;
+      }
+    }
+
+    const sessionName = mainSession.name ?? baseName;
+
+    // Build source with explicit accountId if configured, else fall back to session state
+    const hbAccountId = agent.heartbeat?.accountId ?? mainSession.lastAccountId;
+    const source =
+      hbAccountId && mainSession.lastChannel && mainSession.lastTo
+        ? { channel: mainSession.lastChannel, accountId: hbAccountId, chatId: mainSession.lastTo }
+        : undefined;
+
+    // Send heartbeat prompt with agent info
+    await publishSessionPrompt(sessionName, {
+      prompt: HEARTBEAT_PROMPT,
+      source,
+      _heartbeat: true,
+      _agentId: agentId,
+    });
+
+    return true;
+  }
+
+  /**
+   * Get status of all heartbeat timers.
+   */
+  getStatus(): Array<{
+    agentId: string;
+    enabled: boolean;
+    intervalMs: number;
+    lastTrigger: number;
+    hasTimer: boolean;
+  }> {
+    const agents = dbListAgents();
+    return agents.map((agent) => {
+      const timer = this.timers.get(agent.id);
+      return {
+        agentId: agent.id,
+        enabled: agent.heartbeat?.enabled ?? false,
+        intervalMs: agent.heartbeat?.intervalMs ?? 1800000,
+        lastTrigger: timer?.lastTrigger ?? 0,
+        hasTimer: !!timer?.intervalTimer,
+      };
+    });
+  }
+}
+
+// Singleton instance
+let runner: HeartbeatRunner | null = null;
+
+/**
+ * Get or create the heartbeat runner instance.
+ */
+export function getHeartbeatRunner(): HeartbeatRunner {
+  if (!runner) {
+    runner = new HeartbeatRunner();
+  }
+  return runner;
+}
+
+/**
+ * Start the heartbeat runner.
+ */
+export async function startHeartbeatRunner(): Promise<void> {
+  await getHeartbeatRunner().start();
+}
+
+/**
+ * Stop the heartbeat runner.
+ */
+export async function stopHeartbeatRunner(): Promise<void> {
+  if (runner) {
+    await runner.stop();
+    runner = null;
+  }
+}

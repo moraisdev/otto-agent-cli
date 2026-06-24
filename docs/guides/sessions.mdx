@@ -1,0 +1,384 @@
+---
+title: Sessions
+description: Manage agent sessions, ephemeral TTLs, cross-session messaging, and multi-agent coordination.
+---
+
+## Overview
+
+A session is a persistent conversation between an agent and a user (or system). Each session has a unique key, an associated agent, and optional channel routing for message delivery. Sessions store conversation history, token counts, model overrides, and metadata.
+
+Sessions are the communication boundary, not the unit of tracked work. Use `otto tasks` when the work needs an owner, progress, and a terminal state. Use `otto eval` when you need reproducible measurement or regression checks.
+
+## Session Types
+
+### Permanent Sessions
+
+The default type. Permanent sessions persist indefinitely until explicitly reset or deleted.
+
+### Ephemeral Sessions
+
+Sessions with a time-to-live (TTL). When the TTL expires, the session is automatically deleted. Ten minutes before expiration, the agent receives a system notification with CLI commands to extend, keep, or delete the session.
+
+The ephemeral lifecycle:
+
+1. A session is made ephemeral with `set-ttl`
+2. The countdown starts from the current time
+3. At T-10 minutes, the agent receives a `[System] Inform:` warning
+4. The agent can `extend` (add more time), `keep` (make permanent), or `delete`
+5. If no action is taken, the session is automatically deleted by the runner
+
+## Session Keys
+
+Every session is identified by a hierarchical key that encodes the agent, channel, scope, and peer.
+
+### Key Format
+
+```
+agent:{agentId}:{scope}
+```
+
+The scope portion varies based on the DM scope setting:
+
+| DM Scope | Key Format | Example |
+|----------|------------|---------|
+| `main` | `agent:X:main` | `agent:main:main` |
+| `per-peer` | `agent:X:dm:{phone}` | `agent:main:dm:5511999999999` |
+| `per-channel-peer` | `agent:X:{channel}:dm:{phone}` | `agent:main:whatsapp:dm:5511999999999` |
+| `per-account-channel-peer` | `agent:X:{channel}:{account}:dm:{phone}` | `agent:main:whatsapp:vendas:dm:5511999999999` |
+
+### Group and Thread Keys
+
+Groups and threads are always fully isolated regardless of DM scope:
+
+```
+agent:main:whatsapp:vendas:group:120363123456@g.us
+agent:main:slack:channel:C123:thread:1234567890
+```
+
+### Special Session Keys
+
+Certain features create their own isolated sessions:
+
+| Feature | Key Format | Example |
+|---------|------------|---------|
+| Cron jobs | `agent:{agentId}:cron:{jobId}` | `agent:main:cron:abc123` |
+| Event triggers | `agent:{agentId}:trigger:{triggerId}` | `agent:main:trigger:a1b2c3d4` |
+
+## Listing Sessions
+
+```bash
+# List all sessions
+otto sessions list
+
+# Filter by agent
+otto sessions list --agent main
+
+# Show only ephemeral sessions
+otto sessions list --ephemeral
+```
+
+The list shows session name, agent, token usage, last activity, type (permanent/ephemeral), expiration date, and display name.
+
+## Session Details
+
+```bash
+otto sessions info <name>
+```
+
+Shows the full session record: key, display name, agent, model override, thinking level, SDK session ID, token breakdown (input/output/total/context), channel routing, ephemeral status, queue configuration, compaction count, and timestamps.
+
+## Reading History
+
+```bash
+# Read last 20 messages (default)
+otto sessions read <name>
+
+# Read last 50 messages
+otto sessions read <name> -n 50
+```
+
+Returns normalized message history (user and assistant messages only, no tool calls). Messages are read from the SDK transcript JSONL file. Silent responses (`@@SILENT@@`) are excluded.
+
+## Inspecting Session Trace
+
+Use `sessions trace` when you need to understand what happened in a real session
+end to end. Unlike `sessions read`, trace includes channel ingress, routing,
+dispatch decisions, runtime startup, adapter requests, tool activity, assistant
+messages, response emission, delivery observations, and terminal turn state.
+
+SQLite is the canonical source for this inspection path. NATS and daemon logs
+can help with live or process-level debugging, but they are not required to
+reconstruct the persisted session trace.
+
+```bash
+# Read the last two hours and explain common incident patterns
+otto sessions trace <name> --since 2h --explain
+
+# Narrow to one provider turn
+otto sessions trace <name> --turn <turn_id> --explain
+
+# Follow a source channel message
+otto sessions trace <name> --message <source_message_id> --explain
+
+# Inspect a request/correlation id inside payloads
+otto sessions trace <name> --correlation <correlation_id> --raw --explain
+```
+
+Useful filters:
+
+```bash
+otto sessions trace <name> --only adapter
+otto sessions trace <name> --only tools
+otto sessions trace <name> --only delivery
+otto sessions trace <name> --only dispatch
+otto sessions trace <name> --only turn
+otto sessions trace <name> --since 30m --limit 40
+otto sessions trace <name> --json
+```
+
+Payload flags are explicit because prompts and request payloads can contain
+sensitive operational context:
+
+```bash
+otto sessions trace <name> --show-system-prompt
+otto sessions trace <name> --turn <turn_id> --show-user-prompt
+otto sessions trace <name> --turn <turn_id> --raw
+```
+
+`--show-system-prompt` resolves the latest system prompt for the session; it
+does not require a visible `turn` row in the selected trace window. User prompt
+and raw request payloads remain turn/request-scoped.
+
+When reading a trace, first check whether the sequence reached
+`adapter.request`. If it did, Otto built the final provider request. If it did
+not, look earlier in `channel`, `routing`, `prompt`, `dispatch`, and
+`runtime.start` rows.
+
+Common incident cues from `--explain`:
+
+| Finding | What it usually means |
+| --- | --- |
+| `prompt-without-adapter-request` | Prompt did not reach provider handoff; inspect queue, debounce, task barrier, or runtime startup. |
+| `adapter-request-without-terminal-turn` | Provider request was built, but no terminal turn state was recorded. |
+| `response-without-delivery` | Otto emitted a response, but the gateway did not record final delivery. |
+| `delivery-failed` / `delivery-dropped` | Outbound channel delivery failed or was intentionally dropped, often because of target/routing. |
+| `interruption-or-abort` | A turn was interrupted or an abort was requested. Read `abortReason` and nearby `dispatch.*` rows. |
+| `runtime-stalled` | Active runtime turn stopped receiving provider events and was recovered as a failed turn without resetting session history. |
+| `timeout` | Runtime idle timeout or turn timeout was observed. |
+| `resume-disabled-with-provider-session` | Resume was disabled even though a provider session id existed; inspect reset, delete, fork, provider switch, or model/runtime changes. |
+| `tool-start-without-end` | Tool began but no completion event was recorded. |
+| `system-prompt-changed` | More than one system prompt hash appeared in the trace window. |
+
+SDE incident golden path for "the agent saw my message but did not reply":
+
+```bash
+otto sessions trace <name> --since 2h --explain
+otto sessions trace <name> --message <source_message_id> --explain
+otto sessions trace <name> --turn <turn_id> --explain
+```
+
+Classify the gap by the last reliable row:
+
+| Last reliable row | Likely boundary |
+| --- | --- |
+| no `channel.message.received` | inbound did not reach Otto or the window/session is wrong |
+| `channel.message.received` without `route.resolved` | routing or contact resolution |
+| `route.resolved` without `prompt.published` | session stream publish |
+| `prompt.published` without `adapter.request` | dispatch, task barrier, debounce, concurrency, or runtime startup |
+| `adapter.request` without terminal turn | provider/runtime after handoff |
+| `session.stalled` | silent runtime turn recovered as failed; inspect preceding tool/runtime rows |
+| `assistant.message` without `response.emitted` | silent/no-response behavior, suppression, or interruption |
+| `response.emitted` without `delivery.*` | gateway or outbound observation |
+| `delivery.failed` / `delivery.dropped` | final channel delivery |
+
+For abort or context-loss reports, check `session.abort`, `session.timeout`,
+`turn.interrupted`, `provider_session_id_before`, `provider_session_id_after`,
+and the system prompt hash. `resume=false` with an existing provider session id
+is suspicious unless a reset, delete, fork, provider/model change, or runtime
+capability explains it.
+
+Safe examples should use placeholders such as `<name>`, `<turn_id>`, and
+`<source_message_id>`. Do not paste real phone numbers, group ids, customer
+prompts, context keys, tokens, or provider session ids into docs or shared
+incident notes.
+
+## Managing Sessions
+
+### Rename
+
+```bash
+otto sessions rename <name> "Customer Support Chat"
+```
+
+Sets the display name shown in listings.
+
+### Model Override
+
+```bash
+# Set model for a specific session
+otto sessions set-model <name> opus
+
+# Clear override (use agent default)
+otto sessions set-model <name> clear
+```
+
+Takes effect on the next session start (after reset or daemon restart).
+
+### Thinking Level
+
+```bash
+# Set thinking level
+otto sessions set-thinking <name> verbose
+
+# Options: off, normal, verbose, clear
+otto sessions set-thinking <name> clear
+```
+
+Also takes effect on the next session start.
+
+### Reset
+
+```bash
+otto sessions reset <name>
+```
+
+Clears the conversation history but preserves the session configuration (name, routing, model, etc.). The next message starts a fresh conversation. The active SDK subprocess is aborted first.
+
+### Delete
+
+```bash
+otto sessions delete <name>
+```
+
+Permanently removes the session. The SDK subprocess is aborted, then the session record is deleted from the database.
+
+## Ephemeral Sessions
+
+### Make a Session Ephemeral
+
+```bash
+# Set a 5-hour TTL
+otto sessions set-ttl <name> 5h
+```
+
+Supported duration formats: `30m`, `5h`, `1d`.
+
+### Extend
+
+```bash
+# Extend by default 5 hours
+otto sessions extend <name>
+
+# Extend by a specific duration
+otto sessions extend <name> 2h
+```
+
+The extension is added on top of the current expiration time (or the current time, whichever is later).
+
+### Make Permanent
+
+```bash
+otto sessions keep <name>
+```
+
+Converts an ephemeral session back to a permanent one, removing the TTL and expiration.
+
+## Cross-Session Messaging
+
+Sessions can communicate with each other using five message types. This enables multi-agent coordination and information sharing. For tracked execution with progress, dispatch `otto tasks` instead of treating session messaging as backlog management.
+
+### Message Types
+
+| Type | CLI Command | Behavior |
+|------|-------------|----------|
+| **send** | `otto sessions send` | Delivers a prompt; supports wait mode and interactive mode |
+| **inform** | `otto sessions inform` | Fire-and-forget context; agent may reply or silently acknowledge |
+| **execute** | `otto sessions execute` | Fire-and-forget task; agent performs the work using tools |
+| **ask** | `otto sessions ask` | Sends a question; agent answers in-chat if unknown or replies directly if known |
+| **answer** | `otto sessions answer` | Delivers a response to a previous ask; agent always processes it |
+
+### Send
+
+The most versatile command. Supports three modes:
+
+```bash
+# Fire-and-forget (default): send and return immediately
+otto sessions send <name> "Generate the weekly report"
+
+# Wait mode: send and stream the response to your terminal
+otto sessions send <name> "What is the current status?" -w
+
+# Interactive mode: open a chat loop with the target session
+otto sessions send <name> -i
+```
+
+By default, `send` is still fire-and-forget. Internally it injects an informational prompt with source attribution. Use `-w` only when the caller needs to wait for and stream the response.
+
+Use `-a <agent>` to auto-create the session if it does not exist:
+
+```bash
+otto sessions send new-task -a main "Process this data"
+```
+
+Interactive mode supports `/reset`, `/info`, and `/exit` commands.
+
+### Inform
+
+Send context information. The agent can silently acknowledge (`@@SILENT@@`) if the information is not relevant:
+
+```bash
+otto sessions inform <name> "The deploy completed successfully at 14:30"
+```
+
+### Execute
+
+Send a task for the agent to perform. The agent uses tools and completes the work without necessarily responding:
+
+```bash
+otto sessions execute <name> "Run the database backup and report the result"
+```
+
+### Ask / Answer Workflow
+
+The ask/answer pattern enables structured multi-agent coordination:
+
+```bash
+# Agent A asks Agent B a question
+otto sessions ask agent:sales:main "What is the pricing for the enterprise plan?" "customer:5511999"
+
+# Agent B receives the question with source attribution:
+# [System] Ask: [from: agent:main:main, sender: customer:5511999] What is the pricing...
+
+# If Agent B knows the answer, it replies directly:
+otto sessions answer agent:main:main "Enterprise plan starts at $499/month" "customer:5511999"
+
+# If Agent B does not know, it asks in the chat and forwards replies back as they come
+```
+
+The ask command includes instructions for the target agent to:
+- Answer immediately if it already knows
+- Otherwise, ask the question in its chat and relay answers back
+- Keep forwarding related follow-ups (not just the first reply)
+
+### Channel Overrides
+
+All messaging commands support channel and target overrides:
+
+```bash
+otto sessions send <name> "message" --channel whatsapp --to 5511999999999
+```
+
+### Source Attribution
+
+All cross-session messages include a `[from: <sessionKey>]` tag so the receiving agent knows who sent it. For ask/answer, an optional sender parameter provides end-user attribution.
+
+## Scope Isolation
+
+Sessions respect REBAC permissions. When scope enforcement is active:
+
+- `sessions list` only shows accessible sessions
+- `sessions info` returns "not found" for inaccessible sessions
+- `sessions send/ask/answer` cannot target sessions outside the caller's scope
+- Modify operations (rename, reset, delete, set-model, set-thinking, set-ttl, extend, keep) require modify permission
+
+This prevents agents from enumerating or interfering with sessions they should not access.

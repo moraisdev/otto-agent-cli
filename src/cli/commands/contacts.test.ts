@@ -1,0 +1,511 @@
+import { afterAll, beforeEach, describe, expect, it, mock } from "bun:test";
+
+afterAll(() => mock.restore());
+const actualCliContextModule = await import("../context.js");
+const actualContactsModule = await import("../../contacts.js");
+const actualRouterDbModule = await import("../../router/router-db.js");
+const actualRouterSessionsModule = await import("../../router/sessions.js");
+
+let contactRecord: Record<string, unknown> | null = null;
+let sessionRecord: Record<string, unknown> | null = null;
+let routeRecords: Array<{ pattern: string; agent: string }> = [];
+let allContacts: Array<Record<string, unknown>> = [];
+let pendingContacts: Array<Record<string, unknown>> = [];
+let accountPendingEntries: Array<Record<string, unknown>> = [];
+let messageRecords: Array<Record<string, unknown>> = [];
+let activityRecords: Array<Record<string, unknown>> = [];
+let sessionSummaryRecords: Array<Record<string, unknown>> = [];
+let timelineRecords: Array<Record<string, unknown>> = [];
+let metadataRecords: Array<Record<string, unknown>> = [];
+let mergeCall: { targetId: string; sourceId: string } | null = null;
+
+function pageRecords<T>(
+  records: T[],
+  options: { limit?: string | number | null; offset?: string | number | null } = {},
+) {
+  const limit = Number(options.limit ?? 50);
+  const offset = Number(options.offset ?? 0);
+  return {
+    total: records.length,
+    limit,
+    offset,
+    items: records.slice(offset, offset + limit),
+  };
+}
+
+function findContactRecord(ref: string): Record<string, unknown> | null {
+  return (
+    contactRecord ??
+    allContacts.find(
+      (contact) =>
+        contact.id === ref ||
+        contact.phone === ref ||
+        ((contact.identities as Array<{ value?: string }> | undefined) ?? []).some(
+          (identity) => identity.value === ref,
+        ),
+    ) ??
+    null
+  );
+}
+
+mock.module("../context.js", () => ({
+  ...actualCliContextModule,
+  getContext: () => undefined,
+  fail: (message: string) => {
+    throw new Error(message);
+  },
+}));
+
+mock.module("../../nats.js", () => ({
+  connectNats: mock(async () => {}),
+  closeNats: mock(async () => {}),
+  ensureConnected: mock(async () => ({})),
+  getNats: mock(() => ({})),
+  isExplicitConnect: () => false,
+  publish: mock(async () => {}),
+  subscribe: mock(() => (async function* () {})()),
+  nats: {
+    emit: mock(async () => {}),
+    subscribe: mock(() => (async function* () {})()),
+    close: mock(async () => {}),
+  },
+}));
+
+mock.module("../../contacts.js", () => ({
+  ...actualContactsModule,
+  getAllContacts: () => allContacts,
+  getContact: (ref: string) => findContactRecord(ref),
+  getContactDetails: (ref: string) => {
+    const contact = findContactRecord(ref);
+    if (!contact) return null;
+    return {
+      contact: {
+        id: contact.id,
+        kind: "person",
+        displayName: contact.name ?? null,
+        primaryPhone: contact.phone ?? null,
+        primaryEmail: contact.email ?? null,
+        avatarUrl: null,
+        metadata: { source: "contacts", identityModel: "canonical" },
+        createdAt: contact.created_at,
+        updatedAt: contact.updated_at,
+      },
+      platformIdentities: [
+        {
+          id: "pi-phone",
+          ownerType: "contact",
+          ownerId: contact.id,
+          channel: "phone",
+          instanceId: "",
+          platformUserId: contact.phone,
+          normalizedPlatformUserId: contact.phone,
+          platformDisplayName: contact.name ?? null,
+          avatarUrl: null,
+          profileData: null,
+          isPrimary: true,
+          confidence: 1,
+          linkedBy: "initial",
+          linkReason: "manual",
+          firstSeenAt: contact.created_at,
+          lastSeenAt: contact.updated_at,
+          createdAt: contact.created_at,
+          updatedAt: contact.updated_at,
+        },
+      ],
+      policy: {
+        contactId: contact.id,
+        status: contact.status,
+        replyMode: contact.reply_mode,
+        allowedAgents: contact.allowedAgents,
+        optOut: contact.opt_out,
+        tags: contact.tags,
+        notes: contact.notes,
+        source: contact.source,
+        lastInboundAt: contact.last_inbound_at,
+        lastOutboundAt: contact.last_outbound_at,
+        interactionCount: contact.interaction_count,
+        createdAt: contact.created_at,
+        updatedAt: contact.updated_at,
+      },
+      duplicateCandidates: [],
+    };
+  },
+  getPendingContacts: () => pendingContacts,
+  upsertContact: () => {},
+  deleteContact: () => false,
+  allowContact: () => {},
+  blockContact: () => {},
+  normalizePhone: (value: string) => value,
+  formatPhone: (value: string) => value,
+  setContactReplyMode: () => {},
+  updateContact: () => {},
+  findContactsByTag: () => [],
+  searchContacts: () => [],
+  addContactTag: () => {},
+  removeContactTag: () => {},
+  setOptOut: () => {},
+  linkContactIdentity: () => {},
+  unlinkContactIdentity: () => null,
+  mergeContacts: (targetId: string, sourceId: string) => {
+    mergeCall = { targetId, sourceId };
+    return { merged: 2 };
+  },
+  setContactKind: () => {},
+  listDuplicateContacts: () => [],
+  listContactEvents: (contactId: string, options?: { limit?: string; offset?: string }) => ({
+    contactId,
+    ...pageRecords(
+      timelineRecords.filter((record) => record.contactId === contactId),
+      options,
+    ),
+  }),
+  listContactMetadata: (contactId: string) => metadataRecords.filter((record) => record.contactId === contactId),
+  addContactNote: () => ({}),
+  setContactMetadata: () => ({}),
+  removeContactMetadata: () => ({ removed: false, previous: null, event: null }),
+  listAccountPending: (account?: string) =>
+    accountPendingEntries
+      .filter((entry) => !account || entry.accountId === account)
+      .map((entry) => ({
+        ...entry,
+        pendingKind: entry.isGroup ? "chat" : "contact",
+        chatType: entry.isGroup ? "group" : "dm",
+      })),
+  listAccountPendingContacts: (account?: string) =>
+    accountPendingEntries
+      .filter((entry) => (!account || entry.accountId === account) && !entry.isGroup)
+      .map((entry) => ({
+        ...entry,
+        pendingKind: "contact",
+        chatType: "dm",
+      })),
+  listAccountPendingChats: (account?: string) =>
+    accountPendingEntries
+      .filter((entry) => (!account || entry.accountId === account) && entry.isGroup)
+      .map((entry) => ({
+        ...entry,
+        pendingKind: "chat",
+        chatType: "group",
+      })),
+}));
+
+mock.module("../../router/router-db.js", () => ({
+  ...actualRouterDbModule,
+  dbListRoutes: () => routeRecords,
+  dbListMessageMetaByContactId: (contactId: string, options?: { limit?: string; offset?: string }) => ({
+    contactId,
+    ...pageRecords(
+      messageRecords.filter((record) => record.contactId === contactId),
+      options,
+    ),
+  }),
+}));
+
+mock.module("../../router/sessions.js", () => ({
+  ...actualRouterSessionsModule,
+  findSessionByChatId: () => sessionRecord,
+}));
+
+mock.module("../../session-trace/session-trace-db.js", () => ({
+  listSessionEventsByContactId: (contactId: string, options?: { limit?: string; offset?: string }) => ({
+    contactId,
+    ...pageRecords(
+      activityRecords.filter((record) => record.contactId === contactId),
+      options,
+    ),
+  }),
+  listContactSessionSummaries: (contactId: string, options?: { limit?: string; offset?: string }) => ({
+    contactId,
+    ...pageRecords(
+      sessionSummaryRecords.filter((record) => record.contactId === contactId),
+      options,
+    ),
+  }),
+}));
+
+mock.module("../../permissions/scope.js", () => ({
+  getScopeContext: () => undefined,
+  isScopeEnforced: () => false,
+  canAccessSession: () => true,
+  canModifySession: () => true,
+  canAccessContact: () => true,
+  canAccessResource: () => true,
+  canViewAgent: () => true,
+  canWriteContacts: () => true,
+  filterAccessibleSessions: <T>(_: unknown, sessions: T[]) => sessions,
+  filterVisibleAgents: <T>(_: unknown, agents: T[]) => agents,
+}));
+
+const { ContactsCommands } = await import("./contacts.js");
+
+function captureLogs(run: () => void): string {
+  const lines: string[] = [];
+  const originalLog = console.log;
+  console.log = (...args: unknown[]) => {
+    lines.push(args.map((arg) => String(arg)).join(" "));
+  };
+
+  try {
+    run();
+  } finally {
+    console.log = originalLog;
+  }
+
+  return lines.join("\n");
+}
+
+function captureJson(run: () => void): Record<string, unknown> {
+  return JSON.parse(captureLogs(run)) as Record<string, unknown>;
+}
+
+describe("ContactsCommands info", () => {
+  beforeEach(() => {
+    contactRecord = {
+      id: "contact-1",
+      phone: "5511999999999",
+      name: "Alice",
+      email: "alice@example.com",
+      status: "allowed",
+      allowedAgents: ["main"],
+      reply_mode: "mention",
+      tags: ["vip"],
+      notes: { company: "Acme" },
+      opt_out: false,
+      source: "manual",
+      interaction_count: 3,
+      last_inbound_at: "2026-04-11 12:00:00",
+      last_outbound_at: "2026-04-11 12:05:00",
+      created_at: "2026-04-10 10:00:00",
+      updated_at: "2026-04-11 12:05:00",
+      identities: [{ platform: "phone", value: "5511999999999", isPrimary: true }],
+    };
+    allContacts = [contactRecord];
+    pendingContacts = [];
+    accountPendingEntries = [];
+    messageRecords = [];
+    activityRecords = [];
+    sessionSummaryRecords = [];
+    timelineRecords = [];
+    metadataRecords = [];
+    mergeCall = null;
+    sessionRecord = { name: "wa-support" };
+    routeRecords = [{ pattern: "5511999999999", agent: "sales" }];
+  });
+
+  it("labels persisted contact fields plus resolver and session lookups", () => {
+    const output = captureLogs(() => {
+      new ContactsCommands().info("contact-1");
+    });
+
+    expect(output).toContain("source=contact-db freshness=persisted");
+    expect(output).toContain("source=resolver freshness=derived-now via=route-lookup");
+    expect(output).toContain("source=session-db freshness=derived-now via=identity-lookup");
+    expect(output).toContain("Identities (1):[source=contact-db freshness=persisted]");
+  });
+
+  it("prints typed contact details in --json mode", () => {
+    const payload = captureJson(() => {
+      new ContactsCommands().info("contact-1", true);
+    });
+
+    expect(payload.found).toBe(true);
+    expect(payload.target).toBe("contact-1");
+    expect((payload.contact as Record<string, unknown>).id).toBe("contact-1");
+    expect(payload.routeAgent).toBe("sales");
+    expect(payload.sessionName).toBe("wa-support");
+    expect(payload.platformIdentities).toHaveLength(1);
+  });
+
+  it("prints contact lists with counts and enriched entities in --json mode", () => {
+    const payload = captureJson(() => {
+      new ContactsCommands().list(undefined, true);
+    });
+
+    expect((payload.counts as Record<string, unknown>).total).toBe(1);
+    const contacts = payload.contacts as Array<Record<string, unknown>>;
+    expect(contacts).toHaveLength(1);
+    expect(contacts[0].routeAgent).toBe("sales");
+  });
+
+  it("prints contact profile cards with evidence sections in --json mode", () => {
+    metadataRecords = [
+      {
+        contactId: "contact-1",
+        scopeType: "global",
+        scopeId: null,
+        key: "profile.summary",
+        value: "Primary Otto operator",
+        source: "agent",
+        confidence: 0.9,
+        updatedByType: "agent",
+        updatedById: "contact-profiler",
+        createdAt: "2026-04-11 12:00:00",
+        updatedAt: "2026-04-11 12:00:00",
+      },
+    ];
+    messageRecords = [
+      {
+        messageId: "msg-1",
+        chatId: "chat-1",
+        contactId: "contact-1",
+        actorType: "contact",
+        transcription: "vamos melhorar contatos",
+        createdAt: 1_778_000_000_000,
+      },
+    ];
+    activityRecords = [
+      {
+        id: 1,
+        sessionKey: "agent:dev:main",
+        sessionName: "dev",
+        contactId: "contact-1",
+        eventType: "channel.message.received",
+        eventGroup: "channel",
+        timestamp: 1_778_000_000_000,
+        seq: 1,
+      },
+    ];
+    sessionSummaryRecords = [
+      {
+        contactId: "contact-1",
+        sessionKey: "agent:dev:main",
+        sessionName: "dev",
+        agentId: "dev",
+        eventCount: 1,
+        messageCount: 1,
+        firstSeenAt: 1_778_000_000_000,
+        lastSeenAt: 1_778_000_000_000,
+        latestEventType: "channel.message.received",
+        latestPreview: "vamos melhorar contatos",
+        latestMessageId: "msg-1",
+      },
+    ];
+
+    const payload = captureJson(() => {
+      new ContactsCommands().profile("contact-1", true);
+    });
+
+    expect(payload.contactId).toBe("contact-1");
+    expect(((payload.card as Record<string, unknown>).header as Record<string, unknown>).displayName).toBe("Alice");
+    expect((payload.card as Record<string, unknown>).summary).toBe("Primary Otto operator");
+    expect((payload.messages as Record<string, unknown>).total).toBe(1);
+    expect((payload.messages as Record<string, unknown>).limit).toBe(10);
+    expect((payload.sessions as Record<string, unknown>).total).toBe(1);
+    expect((payload.activity as Record<string, unknown>).total).toBe(1);
+  });
+
+  it("prints contact activity, messages, and sessions in --json mode", () => {
+    messageRecords = [{ messageId: "msg-1", chatId: "chat-1", contactId: "contact-1", createdAt: 1 }];
+    activityRecords = [
+      {
+        id: 1,
+        sessionKey: "agent:dev:main",
+        sessionName: "dev",
+        contactId: "contact-1",
+        eventType: "channel.message.received",
+        eventGroup: "channel",
+        timestamp: 1,
+        seq: 1,
+      },
+    ];
+    sessionSummaryRecords = [
+      {
+        contactId: "contact-1",
+        sessionKey: "agent:dev:main",
+        sessionName: "dev",
+        agentId: "dev",
+        eventCount: 1,
+        messageCount: 1,
+        firstSeenAt: 1,
+        lastSeenAt: 1,
+        latestEventType: "channel.message.received",
+        latestPreview: null,
+        latestMessageId: "msg-1",
+      },
+    ];
+
+    const messages = captureJson(() => new ContactsCommands().messages("contact-1", undefined, undefined, true));
+    const activity = captureJson(() =>
+      new ContactsCommands().activity("contact-1", undefined, undefined, undefined, true),
+    );
+    const sessions = captureJson(() => new ContactsCommands().sessions("contact-1", undefined, undefined, true));
+
+    expect(messages.total).toBe(1);
+    expect(activity.total).toBe(1);
+    expect(sessions.total).toBe(1);
+  });
+
+  it("splits pending contacts from pending chats in --json mode", () => {
+    pendingContacts = [{ ...contactRecord!, status: "pending" }];
+    accountPendingEntries = [
+      {
+        accountId: "main",
+        phone: "5511888888888",
+        name: "Bob",
+        chatId: "5511888888888@s.whatsapp.net",
+        isGroup: false,
+        createdAt: 1,
+        updatedAt: 2,
+      },
+      {
+        accountId: "main",
+        phone: "group:123",
+        name: "Launch Group",
+        chatId: "123@g.us",
+        isGroup: true,
+        createdAt: 3,
+        updatedAt: 4,
+      },
+    ];
+    contactRecord = null;
+
+    const payload = captureJson(() => {
+      new ContactsCommands().pending("main", true);
+    });
+
+    expect(payload.total).toBe(2);
+    expect(payload.totalContacts).toBe(2);
+    expect(payload.totalChats).toBe(1);
+    expect(payload.pendingContacts).toHaveLength(1);
+    expect(payload.accountPendingContacts).toHaveLength(1);
+    const pendingChats = payload.pendingChats as Array<Record<string, unknown>>;
+    expect(pendingChats[0].pendingKind).toBe("chat");
+    expect(pendingChats[0].type).toBe("group");
+  });
+
+  it("rejects group identities on contact approval", () => {
+    contactRecord = null;
+
+    expect(() => {
+      new ContactsCommands().approve("group:123");
+    }).toThrow("Groups/chats are not contacts");
+  });
+
+  it("merges contacts using source then target argument order", () => {
+    contactRecord = null;
+    allContacts = [
+      {
+        id: "source-contact",
+        phone: "5511111111111",
+        name: "Source",
+        status: "allowed",
+        identities: [{ platform: "phone", value: "5511111111111", isPrimary: true }],
+      },
+      {
+        id: "target-contact",
+        phone: "5522222222222",
+        name: "Target",
+        status: "allowed",
+        identities: [{ platform: "phone", value: "5522222222222", isPrimary: true }],
+      },
+    ];
+
+    const payload = captureJson(() => {
+      new ContactsCommands().merge("source-contact", "target-contact", true);
+    });
+
+    expect(mergeCall).toEqual({ targetId: "target-contact", sourceId: "source-contact" });
+    expect(payload.source).toBe("source-contact");
+    expect(payload.target).toBe("target-contact");
+  });
+});

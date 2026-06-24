@@ -1,0 +1,287 @@
+/**
+ * CLI Registry - Bridges decorators to Commander.js
+ *
+ * Reads metadata from decorated classes and registers them with Commander.
+ */
+
+import { Command as CommanderCommand } from "commander";
+import {
+  getGroupMetadata,
+  getCommandsMetadata,
+  getArgsMetadata,
+  getOptionsMetadata,
+  getScopeMetadata,
+  type CommandMetadata,
+  type ScopeType,
+} from "./decorators.js";
+import { extractOptionName } from "./utils.js";
+import { enforceScopeCheck } from "../permissions/scope.js";
+import { emitCliAuditEvent } from "./audit.js";
+import {
+  dispatchRemote,
+  getRemoteGatewayConfig,
+  resolveContextKeyForRemote,
+  type RemoteGatewayConfig,
+} from "./remote-gateway.js";
+
+type CommandClass = new () => object;
+
+/**
+ * Resolve a nested command path, creating intermediate commands as needed.
+ * e.g. "whatsapp.group" on program creates program → whatsapp → group
+ * Returns the deepest command node.
+ */
+function resolveCommandPath(parent: CommanderCommand, segments: string[], description: string): CommanderCommand {
+  let current = parent;
+  for (let i = 0; i < segments.length; i++) {
+    const name = segments[i];
+    const isLast = i === segments.length - 1;
+
+    // Check if this subcommand already exists
+    let existing = current.commands.find((c) => c.name() === name);
+    if (!existing) {
+      existing = current.command(name).description(isLast ? description : "");
+    } else if (isLast && description) {
+      // Update description if this is the final segment
+      existing.description(description);
+    }
+    current = existing;
+  }
+  return current;
+}
+
+/**
+ * Register all command classes with Commander.
+ * Supports nested groups via dot notation: "whatsapp.group" → otto whatsapp group <cmd>
+ *
+ * Throws if two classes register the same `(groupPath, command)` pair so
+ * collisions are caught at startup instead of silently shadowed by commander.
+ */
+export function registerCommands(program: CommanderCommand, classes: CommandClass[]): void {
+  const seen = new Map<string, { cls: CommandClass; method: string }>();
+  for (const cls of classes) {
+    const groupMeta = getGroupMetadata(cls);
+    if (!groupMeta) continue;
+    for (const cmd of getCommandsMetadata(cls)) {
+      const fullName = `${groupMeta.name}.${cmd.name}`;
+      const prev = seen.get(fullName);
+      if (prev) {
+        throw new Error(
+          `CLI registry collision: command "${fullName}" is registered by both ` +
+            `${prev.cls.name} (method ${prev.method}) and ${cls.name} (method ${cmd.method}). ` +
+            `Each (group, command) pair must be unique.`,
+        );
+      }
+      seen.set(fullName, { cls, method: cmd.method });
+    }
+  }
+
+  for (const cls of classes) {
+    const groupMeta = getGroupMetadata(cls);
+    if (!groupMeta) continue;
+
+    const commandsMeta = getCommandsMetadata(cls);
+    if (commandsMeta.length === 0) continue;
+
+    // Support nested groups via dot notation
+    const segments = groupMeta.name.split(".");
+    const group = resolveCommandPath(program, segments, groupMeta.description);
+
+    const instance = new cls();
+
+    // Tool name uses underscore-separated full path
+    const toolGroupName = segments.join("_");
+
+    // Resolve scope: command-level > group-level > "admin" (fail-secure default)
+    const scopeMap = getScopeMetadata(cls);
+
+    for (const cmdMeta of commandsMeta) {
+      const effectiveScope: ScopeType = scopeMap.get(cmdMeta.method) ?? groupMeta.scope ?? "admin";
+      registerCommand(group, instance, cmdMeta, toolGroupName, effectiveScope);
+    }
+  }
+}
+
+function registerCommand(
+  group: CommanderCommand,
+  instance: object,
+  cmdMeta: CommandMetadata,
+  groupName: string,
+  scope: ScopeType,
+): void {
+  // A command can also be an intermediate group when it has nested subcommands:
+  // e.g. `otto crm account <id>` and `otto crm account create ...`.
+  // If the nested group was registered first, Commander already has the node.
+  const sub =
+    group.commands.find((c) => c.name() === cmdMeta.name) ??
+    group.command(cmdMeta.name).description(cmdMeta.description);
+
+  // Add aliases if specified
+  if (cmdMeta.aliases) {
+    sub.aliases(cmdMeta.aliases);
+  }
+
+  // Get args and options metadata
+  const argsMeta = getArgsMetadata(instance, cmdMeta.method);
+  const optionsMeta = getOptionsMetadata(instance, cmdMeta.method);
+
+  // Add positional arguments to commander
+  for (const arg of argsMeta) {
+    const argName = arg.variadic ? `${arg.name}...` : arg.name;
+    const argDef = arg.required ? `<${argName}>` : `[${argName}]`;
+    if (arg.description) {
+      sub.argument(argDef, arg.description, arg.defaultValue);
+    } else {
+      sub.argument(argDef);
+    }
+  }
+
+  // Add options to commander
+  for (const opt of optionsMeta) {
+    if (opt.description) {
+      sub.option(opt.flags, opt.description, opt.defaultValue as string | boolean | undefined);
+    } else {
+      sub.option(opt.flags);
+    }
+  }
+
+  const toolName = `${groupName}_${cmdMeta.name}`;
+
+  // Set up the action handler
+  sub.action(async (...commanderArgs: unknown[]) => {
+    // Commander passes: args..., options, command
+    const cmd = commanderArgs.pop(); // Command object (unused)
+    void cmd;
+    const options = commanderArgs.pop() as Record<string, unknown>;
+    const positionalArgs = commanderArgs;
+
+    // Build input map for the event
+    const input: Record<string, unknown> = {};
+
+    // Build the final args array in parameter order
+    const finalArgs: unknown[] = [];
+    const totalParams = argsMeta.length + optionsMeta.length;
+
+    for (let i = 0; i < totalParams; i++) {
+      const argAtIndex = argsMeta.find((a) => a.index === i);
+      if (argAtIndex) {
+        const argPosition = argsMeta.indexOf(argAtIndex);
+        finalArgs.push(positionalArgs[argPosition]);
+        input[argAtIndex.name] = positionalArgs[argPosition];
+        continue;
+      }
+
+      const optAtIndex = optionsMeta.find((o) => o.index === i);
+      if (optAtIndex) {
+        const optName = extractOptionName(optAtIndex.flags);
+        finalArgs.push(options[optName]);
+        if (options[optName] !== undefined) {
+          input[optName] = options[optName];
+        }
+      }
+    }
+
+    // Remote gateway mode: forward the invocation to the configured gateway
+    // instead of executing in-process. Local mode is unchanged.
+    const remoteConfig = getRemoteGatewayConfig();
+    if (remoteConfig) {
+      await dispatchRemoteCommand({
+        config: remoteConfig,
+        groupName,
+        command: cmdMeta.name,
+        groupSegments: groupName.split("_"),
+        input,
+      });
+      return;
+    }
+
+    // Scope enforcement (before method execution)
+    const scopeResult = enforceScopeCheck(scope, groupName, cmdMeta.name);
+    if (!scopeResult.allowed) {
+      console.error(scopeResult.errorMessage);
+      // Drain NATS before exiting so audit events are flushed
+      const { flushAuditAndExit } = await import("../permissions/scope.js");
+      await flushAuditAndExit(1);
+    }
+
+    // Execute and emit single event with input + output
+    const startTime = Date.now();
+    let isError = false;
+
+    try {
+      const method = (instance as Record<string, Function>)[cmdMeta.method];
+      const result = method.apply(instance, finalArgs);
+      if (result instanceof Promise) await result;
+    } catch (err) {
+      isError = true;
+      console.error(`Error: ${err instanceof Error ? err.message : err}`);
+    }
+
+    await emitCliAuditEvent({
+      group: groupName,
+      name: cmdMeta.name,
+      tool: toolName,
+      input,
+      isError,
+      status: "completed",
+      durationMs: Date.now() - startTime,
+      closeLazyConnection: true,
+    });
+
+    if (isError) process.exit(1);
+  });
+}
+
+interface DispatchRemoteCommandInput {
+  config: RemoteGatewayConfig;
+  groupName: string;
+  command: string;
+  groupSegments: string[];
+  input: Record<string, unknown>;
+}
+
+async function dispatchRemoteCommand(input: DispatchRemoteCommandInput): Promise<void> {
+  const contextKey = resolveContextKeyForRemote();
+  if (!contextKey) {
+    console.error(
+      `Remote gateway mode is enabled (OTTO_GATEWAY_URL=${input.config.url}) but no runtime context-key is available. ` +
+        "Set OTTO_CONTEXT_KEY or run 'otto daemon init-admin-key' on the gateway host and 'otto context credentials add <rctx>' locally.",
+    );
+    process.exit(1);
+  }
+
+  let result;
+  try {
+    result = await dispatchRemote({
+      groupSegments: input.groupSegments,
+      command: input.command,
+      body: input.input,
+      config: input.config,
+      contextKey,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`Remote gateway request failed: ${message}`);
+    process.exit(1);
+  }
+
+  printRemoteResponse(result);
+  if (!result.ok) {
+    process.exit(1);
+  }
+}
+
+function printRemoteResponse(result: { body: string; contentType: string | null }): void {
+  if (result.body.length === 0) return;
+  const isJson = result.contentType?.includes("application/json") ?? false;
+  if (!isJson) {
+    process.stdout.write(result.body.endsWith("\n") ? result.body : `${result.body}\n`);
+    return;
+  }
+  try {
+    const parsed = JSON.parse(result.body);
+    console.log(JSON.stringify(parsed, null, 2));
+  } catch {
+    process.stdout.write(result.body.endsWith("\n") ? result.body : `${result.body}\n`);
+  }
+}

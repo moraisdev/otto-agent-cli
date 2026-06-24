@@ -1,0 +1,194 @@
+/**
+ * CLI Tool Context
+ *
+ * Provides async-safe context propagation for CLI tools using AsyncLocalStorage.
+ * Tools can access session info, channel context, and other metadata without
+ * explicit parameter passing.
+ */
+
+import { AsyncLocalStorage } from "node:async_hooks";
+import { getRuntimeContextFromEnv, resolveRuntimeContext, OTTO_CONTEXT_KEY_ENV } from "../runtime/context-registry.js";
+import type { ContextRecord } from "../router/router-db.js";
+import { readCredentialsFile, selectDefaultCredentialsKey } from "../runtime/credentials-store.js";
+
+/**
+ * Context available to CLI tools during execution
+ */
+export interface ToolContext {
+  /** Current runtime context ID */
+  contextId?: string;
+  /** Resolved context registry record */
+  context?: ContextRecord;
+  /** Current session key (DB primary key) */
+  sessionKey?: string;
+  /** Current session name (human-readable) */
+  sessionName?: string;
+  /** Agent ID */
+  agentId?: string;
+  /** Channel info for response routing */
+  source?: {
+    channel: string;
+    accountId: string;
+    chatId: string;
+    threadId?: string;
+  };
+  /** Arbitrary metadata */
+  [key: string]: unknown;
+  /** Suppress human CLI stdout when commands are executed through another surface. */
+  suppressCliOutput?: boolean;
+}
+
+/**
+ * AsyncLocalStorage instance for tool context
+ */
+const contextStorage = new AsyncLocalStorage<ToolContext>();
+const originalConsoleLog = console.log.bind(console);
+const originalConsoleInfo = console.info.bind(console);
+let consoleGateInstalled = false;
+
+installContextualConsoleGate();
+
+/**
+ * Run a function with tool context.
+ * Context is automatically propagated through async operations.
+ *
+ * @example
+ * await runWithContext({ sessionKey: "agent:main:main" }, async () => {
+ *   // Tools called here can access the context
+ *   await query({ prompt, options });
+ * });
+ */
+export function runWithContext<T>(context: ToolContext, fn: () => T): T {
+  return contextStorage.run(context, fn);
+}
+
+/**
+ * Get current tool context.
+ * First checks AsyncLocalStorage (in-process), then falls back to OTTO_* env vars
+ * (when running as subprocess via Bash).
+ *
+ * @example
+ * const ctx = getContext();
+ * const sessionKey = ctx?.sessionKey ?? "unknown";
+ */
+export function getContext(): ToolContext | undefined {
+  const store = contextStorage.getStore();
+  if (store) return store;
+
+  const env = process.env;
+
+  // Resolution order:
+  //  1. OTTO_CONTEXT_KEY env var (already handled by getRuntimeContextFromEnv)
+  //  2. ~/.otto/credentials.json `default` entry
+  //  3. Legacy OTTO_AGENT_ID / OTTO_SESSION_* fallback (TODO: remove once sdk/auth fully lands)
+  const resolvedContext = getRuntimeContextFromEnv(env) ?? resolveDefaultCredential();
+  if (resolvedContext) {
+    const ctx: ToolContext = {
+      contextId: resolvedContext.contextId,
+      context: resolvedContext,
+      sessionKey: resolvedContext.sessionKey ?? env.OTTO_SESSION_KEY,
+      sessionName: resolvedContext.sessionName ?? env.OTTO_SESSION_NAME,
+      agentId: resolvedContext.agentId ?? env.OTTO_AGENT_ID,
+    };
+
+    const source = resolvedContext.source;
+    if (source) {
+      ctx.source = {
+        channel: source.channel,
+        accountId: source.accountId,
+        chatId: source.chatId,
+        ...(source.threadId ? { threadId: source.threadId } : {}),
+      };
+    } else if (env.OTTO_CHANNEL && env.OTTO_ACCOUNT_ID && env.OTTO_CHAT_ID) {
+      ctx.source = {
+        channel: env.OTTO_CHANNEL,
+        accountId: env.OTTO_ACCOUNT_ID,
+        chatId: env.OTTO_CHAT_ID,
+        ...(env.OTTO_THREAD_ID ? { threadId: env.OTTO_THREAD_ID } : {}),
+      };
+    }
+
+    return ctx;
+  }
+
+  // Fallback: build context from legacy OTTO_* env vars (set when running via Bash in SDK)
+  // TODO(sdk/auth): drop this fallback once all callers issue runtime context-keys.
+  if (!env.OTTO_SESSION_KEY && !env.OTTO_SESSION_NAME && !env.OTTO_AGENT_ID) return undefined;
+
+  const ctx: ToolContext = {
+    sessionKey: env.OTTO_SESSION_KEY,
+    sessionName: env.OTTO_SESSION_NAME,
+    agentId: env.OTTO_AGENT_ID,
+  };
+
+  if (env.OTTO_CHANNEL && env.OTTO_ACCOUNT_ID && env.OTTO_CHAT_ID) {
+    ctx.source = {
+      channel: env.OTTO_CHANNEL,
+      accountId: env.OTTO_ACCOUNT_ID,
+      chatId: env.OTTO_CHAT_ID,
+      ...(env.OTTO_THREAD_ID ? { threadId: env.OTTO_THREAD_ID } : {}),
+    };
+  }
+
+  return ctx;
+}
+
+/**
+ * Get a specific value from context with type safety.
+ *
+ * @example
+ * const sessionKey = getContextValue("sessionKey");
+ */
+export function getContextValue<K extends keyof ToolContext>(key: K): ToolContext[K] | undefined {
+  return getContext()?.[key];
+}
+
+/**
+ * Check if running within a tool context (in-process or via env vars).
+ */
+export function hasContext(): boolean {
+  return (
+    contextStorage.getStore() !== undefined ||
+    !!process.env[OTTO_CONTEXT_KEY_ENV] ||
+    !!process.env.OTTO_SESSION_KEY ||
+    !!process.env.OTTO_SESSION_NAME ||
+    !!process.env.OTTO_AGENT_ID
+  );
+}
+
+function resolveDefaultCredential(): ContextRecord | undefined {
+  let key: string | null;
+  try {
+    key = selectDefaultCredentialsKey(readCredentialsFile());
+  } catch {
+    return undefined;
+  }
+  if (!key) return undefined;
+  const record = resolveRuntimeContext(key, { touch: false });
+  return record ?? undefined;
+}
+
+function installContextualConsoleGate(): void {
+  if (consoleGateInstalled) return;
+  consoleGateInstalled = true;
+  console.log = (...args: unknown[]) => {
+    if (contextStorage.getStore()?.suppressCliOutput === true) return;
+    originalConsoleLog(...args);
+  };
+  console.info = (...args: unknown[]) => {
+    if (contextStorage.getStore()?.suppressCliOutput === true) return;
+    originalConsoleInfo(...args);
+  };
+}
+
+/**
+ * Fail with error. Throws if running inside daemon context,
+ * otherwise logs error and exits.
+ */
+export function fail(message: string): never {
+  if (hasContext()) {
+    throw new Error(message);
+  }
+  console.error(message);
+  process.exit(1);
+}

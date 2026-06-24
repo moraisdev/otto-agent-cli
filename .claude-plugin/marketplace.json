@@ -1,0 +1,21 @@
+{
+  "name": "otto",
+  "owner": {
+    "name": "Pedro Labs"
+  },
+  "metadata": {
+    "description": "Skills for the Otto daemon — multi-channel messaging, agents, contacts, triggers, cron, and more"
+  },
+  "plugins": [
+    {
+      "name": "otto-system",
+      "source": "./src/plugins/internal/otto-system",
+      "description": "Otto system management — agents, contacts, triggers, routes, cron, heartbeat, sessions, permissions, and channels"
+    },
+    {
+      "name": "otto-dev",
+      "source": "./src/plugins/internal/otto-dev",
+      "description": "Otto development tools — architecture docs, prompt system, and internal patterns"
+    }
+  ]
+}

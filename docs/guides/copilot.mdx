@@ -1,0 +1,127 @@
+---
+title: Claude Code Integration
+description: Bidirectional bridge between Otto and Claude Code sessions via hooks and NATS.
+---
+
+## How It Works
+
+```
+CC → Otto:  Global hooks → otto-copilot.sh → nats pub otto.copilot.*
+Otto → CC:  otto copilot send <team> "msg" → ~/.claude/teams/{team}/inboxes/team-lead.json
+```
+
+1. **Global hooks** in `~/.claude/settings.json` fire on every Claude Code event
+2. **Hook script** `~/.claude/hooks/otto-copilot.sh` reads the JSON, wraps it in an envelope, and publishes to NATS
+3. **Otto triggers** subscribe to `otto.copilot.*` topics and react
+4. **Mailbox injection** — Otto writes to CC's inbox JSON to communicate back (CC must be in team mode)
+
+## Commands
+
+### Send message to CC session
+
+```bash
+otto copilot send <teamName> "message"
+otto copilot send <teamName> "message" --from jarvis
+otto copilot send <teamName> "message" --summary "Alert" --color red
+```
+
+### List CC teams
+
+```bash
+otto copilot teams
+```
+
+## NATS Topics
+
+| Topic | CC Event | Description |
+|-------|----------|-------------|
+| `otto.copilot.session.start` | SessionStart | CC session opened |
+| `otto.copilot.session.end` | SessionEnd | CC session closed |
+| `otto.copilot.prompt` | UserPromptSubmit | User sent prompt |
+| `otto.copilot.tool.pre` | PreToolUse | Tool about to execute |
+| `otto.copilot.tool.post` | PostToolUse | Tool executed |
+| `otto.copilot.tool.fail` | PostToolUseFailure | Tool failed |
+| `otto.copilot.stop` | Stop | Claude finished generating |
+| `otto.copilot.subagent.start` | SubagentStart | Subagent created |
+| `otto.copilot.subagent.stop` | SubagentStop | Subagent finished |
+| `otto.copilot.notification` | Notification | CC notification |
+| `otto.copilot.teammate.idle` | TeammateIdle | Teammate went idle |
+| `otto.copilot.config.change` | ConfigChange | CC config changed |
+| `otto.copilot.compact.pre` | PreCompact | Context compaction |
+| `otto.copilot.task.completed` | TaskCompleted | Delegated task completed |
+
+### Payload Envelope
+
+```json
+{
+  "session_id": "abc-123",
+  "session_type": "main",
+  "cwd": "/path/to/project",
+  "event": "PostToolUse",
+  "timestamp": "2026-02-25T17:30:00Z",
+  "data": { }
+}
+```
+
+## Trigger Examples
+
+### Alert on tool failure
+
+```bash
+otto triggers add "CC Tool Failure" \
+  --topic "otto.copilot.tool.fail" \
+  --message "A tool failed in Claude Code. Analyze the error and alert if critical." \
+  --agent main --cooldown 30s --session isolated
+```
+
+### Monitor new sessions
+
+```bash
+otto triggers add "CC Session Start" \
+  --topic "otto.copilot.session.start" \
+  --message "New Claude Code session started. Log the CWD and session_id." \
+  --agent main --cooldown 10s --session isolated
+```
+
+### Monitor dangerous Bash commands
+
+```bash
+otto triggers add "CC Bash Monitor" \
+  --topic "otto.copilot.tool.post" \
+  --message "Tool executed in CC. If Bash with dangerous command (rm -rf, push --force, DROP TABLE), alert immediately. Otherwise @@SILENT@@." \
+  --agent main --cooldown 5s --session isolated
+```
+
+### Notify on session end
+
+```bash
+otto triggers add "CC Session End" \
+  --topic "otto.copilot.session.end" \
+  --message "Claude Code session ended. Update TASKS.md if relevant. @@SILENT@@ if nothing to do." \
+  --agent main --cooldown 10s --session isolated
+```
+
+## Setup
+
+1. Install nats CLI: `nats --version` (or `brew install nats-io/nats-tools/nats`)
+2. Daemon running: `otto daemon status`
+3. Hook script executable: `ls -la ~/.claude/hooks/otto-copilot.sh`
+4. Hooks registered: `cat ~/.claude/settings.json | grep -c "otto-copilot.sh"` (should show 14)
+5. Test: `nats sub "otto.copilot.>" --server nats://127.0.0.1:4222`
+6. Open a CC session — events should appear in the subscriber
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `~/.claude/settings.json` | CC global hooks |
+| `~/.claude/hooks/otto-copilot.sh` | Script that publishes to NATS |
+| `~/.claude/teams/{name}/config.json` | CC team config |
+| `~/.claude/teams/{name}/inboxes/*.json` | Team member mailboxes |
+
+## Notes
+
+- CC must be in **team mode** to receive messages from Otto (inbox poller only runs with an active team)
+- Hook script requires `jq` and `nats` in PATH — fails silently if missing
+- Publishes in background (`&`) — never blocks CC
+- Triggers have anti-loop: events from trigger sessions are ignored

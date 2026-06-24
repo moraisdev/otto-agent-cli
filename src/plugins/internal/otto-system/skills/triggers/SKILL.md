@@ -1,0 +1,153 @@
+---
+name: trigger-manager
+description: |
+  Gerencia triggers de eventos do sistema Otto. Use quando o usuário quiser:
+  - Criar, listar, ver ou deletar triggers
+  - Configurar reações automáticas a eventos (CLI, SDK tools, mensagens)
+  - Ativar/desativar triggers existentes
+  - Testar triggers manualmente
+---
+
+# Trigger Manager
+
+Você gerencia os triggers de eventos do Otto. Triggers são reações automáticas que disparam quando eventos específicos acontecem no sistema.
+
+## Comandos Disponíveis
+
+### Listar triggers
+```bash
+otto triggers list
+```
+
+### Ver detalhes de um trigger
+```bash
+otto triggers show <id>
+```
+
+### Criar trigger
+```bash
+otto triggers add "<nome>" --topic "<pattern>" --message "<prompt>"
+```
+
+Opções:
+- `--agent <id>` - Agent que processa (default: agent padrão)
+- `--cooldown <duration>` - Intervalo mínimo entre disparos (ex: 5s, 1m, 30s)
+- `--session <main|isolated>` - Sessão (default: isolated)
+
+### Ativar/Desativar
+```bash
+otto triggers enable <id>
+otto triggers disable <id>
+```
+
+### Configurar propriedades
+```bash
+otto triggers set <id> <key> <value>
+```
+Keys: name, message, topic, agent, session, cooldown, filter
+
+### Testar trigger
+```bash
+otto triggers test <id>
+```
+
+### Deletar
+```bash
+otto triggers rm <id>
+```
+
+## Tópicos Disponíveis
+
+Patterns usam wildcards (`*`):
+
+### Inbound e Canais
+
+| Pattern | Descrição |
+|---------|-----------|
+| `whatsapp.*.inbound` | Mensagens WhatsApp recebidas |
+| `matrix.*.inbound` | Mensagens Matrix recebidas |
+| `otto.inbound.reaction` | Reações recebidas (emoji) |
+| `otto.inbound.reply` | Replies a mensagens do bot |
+| `otto.inbound.pollVote` | Votos em enquetes |
+
+### Contatos e Aprovações
+
+| Pattern | Descrição |
+|---------|-----------|
+| `otto.contacts.pending` | Novo contato/grupo pendente de aprovação |
+| `otto.approval.request` | Pedido de aprovação cascading |
+| `otto.approval.response` | Resposta de aprovação |
+
+### Agent e Tools
+
+| Pattern | Descrição |
+|---------|-----------|
+| `otto.*.cli.{group}.{command}` | Execuções de CLI tools (ex: `otto.*.cli.contacts.add`) |
+| `otto.*.tool` | Execuções de SDK tools (Bash, Read, etc) |
+
+### Delivery / Receipts
+
+| Pattern | Descrição |
+|---------|-----------|
+| `otto.outbound.deliver` | Mensagens enviadas para canais |
+| `otto.outbound.receipt` | Read receipts enviados |
+
+**Bloqueados (anti-loop):** Triggers em tópicos `otto.session.*` são rejeitados para evitar loops internos.
+
+## Filtros
+
+Triggers suportam filtros opcionais que impedem o disparo quando o evento não casa com a expressão:
+
+```bash
+otto triggers add "..." --filter 'data.cwd startsWith "/path/to/workspace"'
+otto triggers set <id> filter 'data.cwd != "/path/to/ignored-workspace"'
+otto triggers set <id> filter 'data.permission_mode == "bypassPermissions"'
+```
+
+**Sintaxe:** `data.<path> <operador> "<valor>"`
+
+Operadores: `==`, `!=`, `startsWith`, `endsWith`, `includes`
+
+Filtro inválido = fail open (trigger dispara mesmo assim, log de warning).
+
+## Template Variables
+
+Mensagens de triggers suportam `{{variável}}` resolvidos com os dados do evento:
+
+```
+data.cwd startsWith "/path/to/workspace"
+```
+
+| Variável | Descrição |
+|----------|-----------|
+| `{{topic}}` | Tópico NATS que disparou o trigger |
+| `{{data.cwd}}` | Diretório de trabalho da sessão |
+| `{{data.last_assistant_message}}` | Última mensagem do CC (truncada em 300 chars) |
+| `{{data.prompt}}` | Prompt enviado pelo usuário (UserPromptSubmit) |
+| `{{data.<campo>}}` | Qualquer campo do payload do evento |
+
+Variáveis não resolvidas ficam como estão (`{{data.inexistente}}`).
+
+**Exemplo de message com templates:**
+```
+CC parou em {{data.cwd}}. Última msg: "{{data.last_assistant_message}}". Informe o Pedro se relevante, senão @@SILENT@@.
+```
+
+## Exemplos
+
+Criar trigger para notificar quando contatos forem modificados:
+```bash
+otto triggers add "Contato alterado" --topic "otto.*.cli.contacts.*" --message "Analise a mudança e notifique o grupo"
+```
+
+Criar trigger para monitorar erros:
+```bash
+otto triggers add "Agent Error" --topic "otto.*.tool" --message "Analise o erro e sugira correção" --cooldown 1m
+```
+
+## Relação com NATS
+
+Triggers reagem a eventos do **NATS** (o barramento de eventos do Otto). Para entender os tópicos disponíveis, consulte a skill `events`.
+
+- **NATS** = barramento de eventos (pub/sub direto)
+- **triggers** = reações automáticas a eventos NATS

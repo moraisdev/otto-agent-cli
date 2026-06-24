@@ -1,0 +1,43 @@
+---
+title: Otto
+description: The daemon that gives Claude a life.
+---
+
+<CardGroup cols={2}>
+
+<Card title="Quick Start" href="/start/quickstart">
+  Install and run Otto in minutes.
+</Card>
+
+<Card title="CLI Reference" href="/cli/overview">
+  Full command reference for the otto CLI.
+</Card>
+
+<Card title="Architecture" href="/architecture">
+  How the daemon, NATS, omni, and agents fit together.
+</Card>
+
+<Card title="Features" href="/features/overview">
+  Heartbeat, cron, triggers, TTS, and more.
+</Card>
+
+</CardGroup>
+
+## Quick Start
+
+```bash
+# Install dependencies
+bun install
+
+# Run setup wizard
+otto setup
+
+# Start daemon
+otto daemon start
+
+# Connect a WhatsApp instance
+otto instances connect main
+
+# Check status
+otto daemon status
+```
