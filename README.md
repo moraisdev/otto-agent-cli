@@ -12,6 +12,7 @@
 </p>
 
 <p align="center">
+  <a href="https://www.npmjs.com/package/otto-agent-cli"><img src="https://img.shields.io/npm/v/otto-agent-cli?color=cb3837&logo=npm" alt="npm version" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
   <img src="https://img.shields.io/badge/runtime-Bun-f472b6" alt="Bun" />
   <img src="https://img.shields.io/badge/lang-TypeScript-3178c6" alt="TypeScript" />
