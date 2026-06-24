@@ -44,13 +44,33 @@ export function getConsumerName(): string {
 export async function ensureSessionPromptsStream(existingJsm?: JetStreamManager): Promise<void> {
   const jsm = existingJsm ?? (await getNats().jetstreamManager());
 
-  try {
-    await jsm.streams.info(SESSION_STREAM);
-    log.debug("SESSION_PROMPTS stream already exists");
+  const existing = await jsm.streams.info(SESSION_STREAM).catch(() => null);
+  if (existing) {
+    const subjects = existing.config.subjects ?? [];
+    const correct = subjects.length === 1 && subjects[0] === SESSION_SUBJECT_FILTER;
+    if (correct) {
+      log.debug("SESSION_PROMPTS stream already exists");
+      return;
+    }
+    // Reconcile a drifted subject filter. A stale stream (e.g. left by an older
+    // deployment that used a different subject prefix) silently swallows nothing:
+    // prompts published to otto.session.*.prompt never match its filter, so the
+    // consumer gets nothing and NO turns ever run. Fix the subject in place.
+    try {
+      await jsm.streams.update(SESSION_STREAM, { ...existing.config, subjects: [SESSION_SUBJECT_FILTER] });
+      log.warn("Reconciled drifted SESSION_PROMPTS subject filter", {
+        from: subjects,
+        to: [SESSION_SUBJECT_FILTER],
+      });
+    } catch (err) {
+      log.error("Failed to reconcile SESSION_PROMPTS subject filter — prompts may not be delivered", {
+        from: subjects,
+        error: err,
+      });
+    }
     return;
-  } catch {
-    // Stream doesn't exist — create it
   }
+  // Stream doesn't exist — create it.
 
   try {
     await jsm.streams.add({
