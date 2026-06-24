@@ -2732,6 +2732,7 @@ export type SessionsSendInput = {
   threadScope?: string;
   threadSummary?: string;
   threadTitle?: string;
+  timeout?: string;
   to?: string;
   wait?: boolean;
 };

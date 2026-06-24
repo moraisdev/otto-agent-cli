@@ -6343,6 +6343,10 @@ export const SessionsSendInputSchema = {
       "description": "Title required when --thread auto-creates",
       "type": "string"
     },
+    "timeout": {
+      "description": "Max seconds to wait for the reply with -w (default: 120)",
+      "type": "string"
+    },
     "to": {
       "description": "Override delivery target",
       "type": "string"

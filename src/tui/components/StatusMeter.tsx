@@ -59,6 +59,7 @@ export function StatusMeter({ state, startedAt, outputTokens, models }: StatusMe
       <text content={` ${SPINNER[frame]} `} fg={AMBER} />
       <text content={`${STATE_LABEL[state]}… `} fg={AMBER} />
       <text content={`(${parts.join(" · ")})`} fg={DIM} />
+      {state !== "compacting" ? <text content="  ·  Ctrl+C interrompe" fg={DIM} /> : null}
     </box>
   );
 }

@@ -43,8 +43,19 @@ function isBashSleep(command: string): boolean {
 }
 
 /**
+ * Check if a Bash command is a blocking cross-session consult
+ * (`otto sessions send ... -w/--wait`, e.g. the fusion peer consult). From the
+ * caller's side this only WAITS for another session's reply — interrupting it has
+ * no side effect on the caller, so it must be interruptible. Otherwise a stalled
+ * peer would freeze the lead for the whole send timeout with Ctrl+C deferred.
+ */
+function isBlockingSessionConsult(command: string): boolean {
+  return /\botto\s+sessions\s+send\b/.test(command) && /(^|\s)(-w|--wait)(\s|$)/.test(command);
+}
+
+/**
  * Classify a tool call as safe or unsafe.
- * For Bash, inspects the command — sleep is always safe.
+ * For Bash, inspects the command — sleep and blocking session consults are safe.
  */
 export function getToolSafety(toolName: string, toolInput?: Record<string, unknown>): ToolSafety {
   if (SAFE_TOOLS.has(toolName)) {
@@ -56,6 +67,10 @@ export function getToolSafety(toolName: string, toolInput?: Record<string, unkno
     const command = toolInput.command as string;
     if (isBashSleep(command)) {
       log.debug("Bash sleep classified as safe", { command: command.slice(0, 50) });
+      return "safe";
+    }
+    if (isBlockingSessionConsult(command)) {
+      log.debug("Bash session-consult classified as safe (interruptible wait)", { command: command.slice(0, 60) });
       return "safe";
     }
   }

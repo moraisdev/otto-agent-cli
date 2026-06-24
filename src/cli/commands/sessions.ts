@@ -2468,8 +2468,13 @@ export class SessionCommands {
     @Option({ flags: "--thread-scope <type:id>", description: "Scope for thread lookup/create" }) threadScope?: string,
     @Option({ flags: "--thread-owner <type:id>", description: "Owner for thread auto-create" }) threadOwner?: string,
     @Option({ flags: "--barrier <barrier>", description: "Delivery barrier: p0|p1|p2|p3" }) barrier?: string,
+    @Option({ flags: "--timeout <seconds>", description: "Max seconds to wait for the reply with -w (default: 120)" })
+    waitTimeout?: string,
     @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
   ) {
+    const waitTimeoutMs = waitTimeout
+      ? Math.max(1, Number.parseInt(waitTimeout, 10) || 0) * 1000 || undefined
+      : undefined;
     let createdSession = false;
     const session = this.resolveTarget(nameOrKey, agentId, {
       silent: Boolean(asJson),
@@ -2554,6 +2559,7 @@ export class SessionCommands {
           chars = await this.streamToSession(sessionName, fullPrompt, session, channel, to, deliveryBarrier, {
             silent: true,
             promptPayload,
+            timeoutMs: waitTimeoutMs,
             onResponse: (chunk) => {
               responseText += chunk;
             },
@@ -2590,6 +2596,7 @@ export class SessionCommands {
       try {
         chars = await this.streamToSession(sessionName, fullPrompt, session, channel, to, deliveryBarrier, {
           promptPayload,
+          timeoutMs: waitTimeoutMs,
         });
         if (preparedThread) {
           preparedThread = { ...preparedThread, handoff: markThreadHandoffDelivered(preparedThread.handoff.id) };
@@ -3433,11 +3440,17 @@ export class SessionCommands {
     channelOverride?: string,
     toOverride?: string,
     deliveryBarrier: DeliveryBarrier = DEFAULT_DELIVERY_BARRIER,
-    options: { silent?: boolean; onResponse?: (chunk: string) => void; promptPayload?: Record<string, unknown> } = {},
+    options: {
+      silent?: boolean;
+      onResponse?: (chunk: string) => void;
+      promptPayload?: Record<string, unknown>;
+      timeoutMs?: number;
+    } = {},
   ): Promise<number> {
     let responseLength = 0;
     let settled = false;
     let settleCompletion: ((state: StreamTerminalState) => void) | undefined;
+    const waitTimeoutMs = options.timeoutMs && options.timeoutMs > 0 ? options.timeoutMs : SEND_TIMEOUT_MS;
 
     const runtimeStream = nats.subscribe(`otto.session.${sessionName}.runtime`);
     const claudeStream = nats.subscribe(`otto.session.${sessionName}.claude`);
@@ -3464,8 +3477,19 @@ export class SessionCommands {
         if (!options.silent) {
           console.log("\n⏱️  Timeout");
         }
+        // Stop the target session's turn so a non-responding (or runaway) peer
+        // does not keep burning the provider after we've stopped waiting for it.
+        nats
+          .emit("otto.session.abort", {
+            sessionKey: session.sessionKey,
+            sessionName,
+            source: "cli",
+            action: "sessions.send.timeout",
+            reason: "send_wait_timeout",
+          })
+          .catch(() => {});
         settle({ kind: "timeout" });
-      }, SEND_TIMEOUT_MS);
+      }, waitTimeoutMs);
 
       (async () => {
         try {

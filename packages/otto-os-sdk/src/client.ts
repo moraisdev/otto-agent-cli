@@ -3036,6 +3036,7 @@ export class OttoClient {
       threadScope?: string;
       threadSummary?: string;
       threadTitle?: string;
+      timeout?: string;
       to?: string;
       wait?: boolean;
     }): Promise<SessionsSendReturn> => {
