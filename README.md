@@ -133,13 +133,34 @@ your prompt
 - **Failover.** If the principal hits its provider quota, the peer takes over editing for the next turns and the principal rejoins automatically when its quota resets.
 - **Solo when you want it.** Turn fusion off to run just the principal alone.
 
-## Omnipresent Sessions
+## Continue from your phone — terminal ↔ WhatsApp / Telegram
 
-An Otto session is owned by a local daemon; your terminal and your phone are just *windows* into it.
+This is the part nothing else does: **your coding session isn't trapped in the terminal.**
+The session lives in a local daemon — your terminal and your phone are just *windows* into the
+**same live session**: same context, same working directory, same Claude + Codex pairing.
 
-- **Project-scoped.** `otto code` roots a session in your current directory, so the model works in the right repo.
-- **Group = session.** Bind a WhatsApp/Telegram chat to a session and inbound messages land in that same session and working directory.
-- **Fan-out.** A reply is mirrored to bound channels, so a turn you drive from the terminal also reaches your phone.
+A typical flow:
+
+```text
+🖥️  terminal                          📱 WhatsApp / Telegram
+────────────                          ─────────────────────
+otto code  ──┐                        "did the tests pass? ship it"
+  coding…    │   same live session     ──┐
+             ├───────────────────────────┤   ← continues the SAME session:
+  step away ─┘                          ──┘     full context, same repo,
+                                                same Claude + Codex pair
+```
+
+1. You're coding in the terminal (`otto` or `otto code`) on a feature.
+2. You need to step out — in the TUI, click **remoto → WhatsApp** (scan the QR) or **Telegram** to bind the session to a chat.
+3. From your phone you message the agent in that chat ("did the tests pass? then commit") and it **continues the exact same session** — it remembers everything, edits the same repo, and keeps Claude + Codex paired.
+4. Replies fan out back to the chat, so you stay in the loop from anywhere. Start at your desk, finish from your phone — or the other way around.
+
+Under the hood:
+
+- **Project-scoped** — `otto code` roots a session in your current directory, so the agent works in the right repo.
+- **Group = session** — bind a WhatsApp/Telegram chat to a session; inbound messages land in that same session and working directory.
+- **Fan-out** — a reply is mirrored to bound channels, so a terminal-driven turn also reaches your phone.
 
 ## Architecture
 
