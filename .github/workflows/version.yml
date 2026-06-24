@@ -141,7 +141,11 @@ jobs:
           fi
 
           git tag "v${VERSION}"
-          git push --atomic origin "HEAD:refs/heads/${BRANCH}" "refs/tags/v${VERSION}"
+          # --no-verify: the local pre-push gate (gen/build/typecheck/test) is for
+          # human pushes; CI already validated this commit via the CI workflow, and
+          # the gate's sdk:check needs the generated command barrel which isn't built
+          # at this step. Re-running it here only causes false failures.
+          git push --no-verify --atomic origin "HEAD:refs/heads/${BRANCH}" "refs/tags/v${VERSION}"
 
       - name: Build package
         run: bun run build

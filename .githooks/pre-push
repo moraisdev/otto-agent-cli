@@ -10,6 +10,11 @@ fi
 
 echo "Running pre-push checks..."
 
+# Generate the CLI command barrel first — sdk:check/build import it, and on a
+# fresh checkout (no prior build) it doesn't exist yet.
+echo "Generating command barrel..."
+bun run gen:commands >/dev/null
+
 echo "Checking generated SDK drift..."
 if ! bun run sdk:check; then
   echo ""
