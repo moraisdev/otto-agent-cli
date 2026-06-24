@@ -7,15 +7,12 @@
  * everywhere. Any failure degrades gracefully to a plain solo turn.
  */
 
-import { publishSessionPrompt } from "../omni/session-stream.js";
-import { dbGetAgent } from "../router/router-db.js";
 import type { RuntimeProviderId } from "../runtime/types.js";
 import { logger } from "../utils/logger.js";
-import { companionAgentId, companionSessionKey } from "./companion-id.js";
+import { companionAgentId } from "./companion-id.js";
 import { ensurePeerCompanion, peerModelFor } from "./companion.js";
 import {
   buildBothExhaustedNotice,
-  buildCompanionBrief,
   buildFusionLeadPlaybook,
   buildPeerEditorPlaybook,
   buildSoloNotice,
@@ -121,7 +118,7 @@ export async function ensureFusionForTurn(input: EnsureFusionInput): Promise<Fus
     // Stable per-agent collaboration id (NOT a per-turn UUID) so the playbook
     // prefix stays identical across turns and the prompt cache keeps hitting.
     const collaborationId = input.mintId ? input.mintId() : `fusion-${input.leadAgent.id}`;
-    ensureFusionCompanion(input.leadAgent, principal, peer);
+    ensurePeerCompanion(input.leadAgent, peer, principal);
     await tryEnsureObserverRule(input.leadAgent.id, companionAgentId(input.leadAgent.id), peer);
     return {
       fused: true,
@@ -133,29 +130,6 @@ export async function ensureFusionForTurn(input: EnsureFusionInput): Promise<Fus
     // Never break a turn because fusion setup failed — fall back to solo.
     log.warn("Fusion activation failed; falling back to solo turn", { session: input.leadSessionName, error: err });
     return { fused: false };
-  }
-}
-
-/**
- * Ensure the peer companion exists (running the non-principal provider) and warm
- * it with its consultant brief — on first creation AND whenever the principal
- * flips, so the brief always frames the current lead/peer roles.
- */
-function ensureFusionCompanion(
-  lead: { id: string; cwd: string },
-  principal: FusionProvider,
-  peer: FusionProvider,
-): void {
-  const compId = companionAgentId(lead.id);
-  const existing = dbGetAgent(compId);
-  const needsWarm = !existing || existing.provider !== peer;
-  ensurePeerCompanion(lead, peer);
-
-  if (needsWarm) {
-    publishSessionPrompt(companionSessionKey(compId), {
-      prompt: buildCompanionBrief({ leadSessionName: `agent:${lead.id}:main`, principal, peer }),
-      _agentId: compId,
-    }).catch((err) => log.warn("Failed to warm companion brief", { compId, error: err }));
   }
 }
 
