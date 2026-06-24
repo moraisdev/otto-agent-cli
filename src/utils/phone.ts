@@ -21,8 +21,8 @@ const USER_JID_RE = /^(\d+)(?::(\d+))?@s\.whatsapp\.net$/i;
 const LID_JID_RE = /^(\d+)@lid$/i;
 /** Group JID */
 const GROUP_JID_RE = /^(\d+(?:-\d+)?)@g\.us$/i;
-/** Phone number with optional + prefix and formatting */
-const PHONE_RE = /^\+?[\d\s\-().]+$/;
+/** Phone number with optional + prefix and formatting; must contain at least one digit */
+const PHONE_RE = /^\+?[\d\s\-().]*\d[\d\s\-().]*$/;
 
 interface JidComponents {
   user: string;
