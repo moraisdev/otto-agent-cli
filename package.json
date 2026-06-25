@@ -1,6 +1,6 @@
 {
   "name": "otto-agent-cli",
-  "version": "3.260625.8",
+  "version": "3.260625.9",
   "description": "The first multimodal, multi-model AI coding agent for your terminal — pair Claude + Codex on every turn and take the same session to WhatsApp or Telegram. Local-first and open source.",
   "keywords": [
     "ai",
