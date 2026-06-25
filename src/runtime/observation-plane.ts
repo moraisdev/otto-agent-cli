@@ -327,6 +327,12 @@ export function ensureObservationSchema(): void {
   ensureObservationColumn("observer_bindings", "observer_profile_source", "TEXT");
   ensureObservationColumn("observer_bindings", "observer_profile_snapshot_markdown", "TEXT");
   ensureObservationColumn("observer_bindings", "debounce_ms", "INTEGER");
+  // Legacy cleanup: the async fusion observer was retired (the review now runs as
+  // a synchronous gate, see runtime/fusion-gate). Purge any leftover
+  // `fusion-reviewer` rules/bindings so they don't keep spawning obs:* review
+  // sessions that tie up the peer companion.
+  db.exec("DELETE FROM observer_rules WHERE observer_role = 'fusion-reviewer';");
+  db.exec("DELETE FROM observer_bindings WHERE observer_role = 'fusion-reviewer';");
   schemaReady = true;
   schemaDbPath = dbPath;
 }

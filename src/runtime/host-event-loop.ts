@@ -56,18 +56,12 @@ import type {
 const log = logger.child("bot");
 
 const MAX_OUTPUT_LENGTH = 1000;
-// Tools whose use means the lead changed the working tree this turn, so the
-// fusion review gate should run. Read-only tools (Read/Grep/Glob) don't trigger
-// a review — a pure Q&A turn never blocks on the peer.
-const FILE_MUTATING_TOOLS = new Set([
-  "Edit",
-  "Write",
-  "MultiEdit",
-  "NotebookEdit",
-  "apply_patch",
-  "str_replace_editor",
-  "Bash",
-]);
+// Edit tools whose use means the lead actually changed code this turn, so the
+// fusion review gate should run. Bash is intentionally EXCLUDED — a read-only
+// `git log`/`ls`/`grep` (or the converge consult itself) must NOT trigger a
+// review, or every Q&A turn would block on the peer. Mirrors the converge gate's
+// CONVERGE_GATE_EDIT_TOOLS.
+const FILE_EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch", "str_replace_editor"]);
 const MAX_TURN_FAILURE_LOG_DETAIL = 1800;
 const MAX_TURN_FAILURE_RESPONSE = 320;
 
@@ -803,7 +797,7 @@ export async function runRuntimeEventLoop(options: RunRuntimeEventLoopOptions): 
       if (event.type === "tool.started") {
         streaming.lastToolFailure = undefined;
         streaming.toolRunning = true;
-        if (FILE_MUTATING_TOOLS.has(event.toolUse.name)) {
+        if (FILE_EDIT_TOOLS.has(event.toolUse.name)) {
           turnTouchedFiles = true;
         }
         // Surface the converge consult as live peer status ("avaliando…") so the
