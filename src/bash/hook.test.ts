@@ -101,6 +101,13 @@ describe("createBashPermissionHook", () => {
   beforeEach(() => {
     relations = [];
     mockContext = undefined;
+    // Isolate from the ambient session: getScopeContext() falls back to these
+    // env vars when its mocked getContext() doesn't provide them, so a real
+    // OTTO_SESSION_KEY="main" from the running shell would leak into the test
+    // and silently bypass own-session checks.
+    delete process.env.OTTO_AGENT_ID;
+    delete process.env.OTTO_SESSION_KEY;
+    delete process.env.OTTO_SESSION_NAME;
   });
 
   it("has matcher set to 'Bash'", () => {
@@ -280,6 +287,9 @@ describe("createToolPermissionHook", () => {
   beforeEach(() => {
     relations = [];
     mockContext = undefined;
+    delete process.env.OTTO_AGENT_ID;
+    delete process.env.OTTO_SESSION_KEY;
+    delete process.env.OTTO_SESSION_NAME;
   });
 
   it("has no matcher (fires for all tools)", () => {
