@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { close as closeChatDb } from "../db.js";
@@ -7,48 +7,13 @@ import { closeSessionAdapterStore } from "../adapters/adapter-db.js";
 import { closeRouterDb } from "../router/router-db.js";
 import { closeSessionStore } from "../router/sessions.js";
 
-const OTTO_STATE_LOCK_DIR = join(tmpdir(), "otto-test-state.lock");
-const OTTO_STATE_LOCK_RETRY_MS = 10;
-const OTTO_STATE_LOCK_STALE_MS = 60_000;
-const OTTO_STATE_LOCK_TIMEOUT_MS = 120_000;
+// State dirs pending removal on process exit — kept so a crashed afterEach
+// doesn't leak temp directories. Bun runs each test file in its own worker, so
+// `process.env.OTTO_STATE_DIR` and the singletons we close below don't cross
+// file boundaries; the previous filesystem-wide mkdir lock was serializing
+// independent workers and starving them past the 5s test timeout.
 const pendingStateDirs = new Set<string>();
 let pendingStateCleanupRegistered = false;
-
-async function acquireOttoStateLock(): Promise<void> {
-  const deadline = Date.now() + OTTO_STATE_LOCK_TIMEOUT_MS;
-
-  while (true) {
-    try {
-      mkdirSync(OTTO_STATE_LOCK_DIR);
-      return;
-    } catch (error) {
-      const err = error as NodeJS.ErrnoException;
-      if (err.code !== "EEXIST") {
-        throw error;
-      }
-
-      try {
-        const stats = statSync(OTTO_STATE_LOCK_DIR);
-        if (Date.now() - stats.mtimeMs > OTTO_STATE_LOCK_STALE_MS) {
-          rmSync(OTTO_STATE_LOCK_DIR, { recursive: true, force: true });
-          continue;
-        }
-      } catch {
-        // The lock may have been released between stat attempts.
-      }
-
-      if (Date.now() >= deadline) {
-        throw new Error("Timed out waiting for isolated Otto state lock");
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, OTTO_STATE_LOCK_RETRY_MS));
-    }
-  }
-}
-
-function releaseOttoStateLock(): void {
-  rmSync(OTTO_STATE_LOCK_DIR, { recursive: true, force: true });
-}
 
 function flushPendingStateDirs(): void {
   for (const dir of pendingStateDirs) {
@@ -67,7 +32,6 @@ function ensurePendingStateCleanup(): void {
 }
 
 export async function createIsolatedOttoState(prefix = "otto-test-"): Promise<string> {
-  await acquireOttoStateLock();
   closeChatDb();
   closeContacts();
   closeSessionAdapterStore();
@@ -88,5 +52,4 @@ export async function cleanupIsolatedOttoState(stateDir?: string | null): Promis
   closeRouterDb();
   delete process.env.OTTO_STATE_DIR;
   if (stateDir) pendingStateDirs.add(stateDir);
-  releaseOttoStateLock();
 }
