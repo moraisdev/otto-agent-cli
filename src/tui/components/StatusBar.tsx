@@ -105,14 +105,10 @@ export function StatusBar({
         </box>
         <box flexDirection="row" onClick={onModelClick} bg={focusBg(0)} flexShrink={0}>
           <text content={`${runtimeLabel.provider}/${runtimeLabel.model}`} fg={focusFg(0, GOLD)} bg={focusBg(0)} />
-          {fusionEnabled && companionModel ? (
-            peerExhausted ? (
-              // Peer out of quota: show it dimmed with a marker so the pairing
-              // doesn't look active when it can't actually run.
-              <text content={` + ${peerProvider} (sem cota)`} fg={focusFg(0, THEME.faint)} bg={focusBg(0)} />
-            ) : (
-              <text content={` + ${peerProvider}/${companionModel}`} fg={focusFg(0, peerColor)} bg={focusBg(0)} />
-            )
+          {fusionEnabled && companionModel && !peerExhausted ? (
+            // Only the peer with quota is shown. When it's out of quota we hide
+            // the segment entirely so the bar reflects what can actually run.
+            <text content={` + ${peerProvider}/${companionModel}`} fg={focusFg(0, peerColor)} bg={focusBg(0)} />
           ) : null}
         </box>
         <box flexGrow={1} bg={BG} />
