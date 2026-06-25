@@ -1,7 +1,7 @@
 /** @jsxImportSource @opentui/react */
 
 import type { RuntimeDisplayLabel } from "../hooks/runtime-display.js";
-import type { TokenUsage } from "../hooks/useNats.js";
+import type { PeerReview, TokenUsage } from "../hooks/useNats.js";
 import { THEME } from "../lib/theme.js";
 
 export interface StatusBarProps {
@@ -28,8 +28,8 @@ export interface StatusBarProps {
   remoteConnected?: boolean;
   /** Number of `Task` subagents currently in flight (lead + peer combined). */
   activeSubagentsCount?: number;
-  /** Pulses briefly when the peer delivers an async review finding. */
-  peerInsight?: boolean;
+  /** Live status of the synchronous peer review gate (reviewing / verdict). */
+  peerReview?: PeerReview | null;
   /** Click handlers for the interactive segments. */
   onModelClick?: () => void;
   onFusionClick?: () => void;
@@ -73,7 +73,7 @@ export function StatusBar({
   remoteLabel = "remoto",
   remoteConnected = false,
   activeSubagentsCount = 0,
-  peerInsight = false,
+  peerReview = null,
   onModelClick,
   onFusionClick,
   onRemoteClick,
@@ -90,6 +90,18 @@ export function StatusBar({
   // Focused segment gets a subtle (muted) highlight so keyboard nav is visible.
   const focusBg = (i: number) => (focusIndex === i ? THEME.dim : undefined);
   const focusFg = (i: number, normal: string) => (focusIndex === i ? "black" : normal);
+
+  // Live peer review-gate badge: reviewing → verdict → (auto-clears).
+  const peerReviewName = peerReview?.provider ?? peerProvider;
+  const peerReviewBadge: { content: string; fg: string } | null = !peerReview
+    ? null
+    : peerReview.state === "reviewing"
+      ? { content: `● ${peerReviewName} revisando…  `, fg: THEME.working }
+      : peerReview.state === "approved"
+        ? { content: `✓ ${peerReviewName} revisado  `, fg: THEME.done }
+        : peerReview.state === "suggested_change"
+          ? { content: `✦ ${peerReviewName}: ${peerReview.summary ?? "ajustes"}  `, fg: peerColor }
+          : { content: `⚠ ${peerReviewName} sem revisão  `, fg: THEME.faint };
 
   // Single left-flowing row (NOT space-between): on a narrow terminal it clips
   // cleanly at the edge instead of the two groups overlapping into garbage.
@@ -139,7 +151,9 @@ export function StatusBar({
         ) : null}
         <box flexGrow={1} bg={BG} />
         {codexWorking ? <text content={`${peerProvider} ⟳  `} fg={peerColor} bg={BG} flexShrink={0} /> : null}
-        {peerInsight ? <text content={`✦ ${peerProvider} insight  `} fg={peerColor} bg={BG} flexShrink={0} /> : null}
+        {peerReviewBadge ? (
+          <text content={peerReviewBadge.content} fg={peerReviewBadge.fg} bg={BG} flexShrink={0} />
+        ) : null}
         {isCompacting ? <text content="compacting  " fg={THEME.working} bg={BG} flexShrink={0} /> : null}
         {ctx > 0 ? <text content={`▦ ${formatTokens(ctx)} `} fg={THEME.dim} bg={BG} flexShrink={0} /> : null}
       </box>

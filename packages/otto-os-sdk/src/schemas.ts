@@ -6344,7 +6344,7 @@ export const SessionsSendInputSchema = {
       "type": "string"
     },
     "timeout": {
-      "description": "Max seconds to wait for the reply with -w (default: 120)",
+      "description": "Max seconds to wait for the reply with -w (default: 120, 0 = no limit)",
       "type": "string"
     },
     "to": {

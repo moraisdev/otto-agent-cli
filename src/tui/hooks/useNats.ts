@@ -93,11 +93,18 @@ export interface UseNatsResult {
    */
   activeSubagents: SubagentInfo[];
   /**
-   * Pulses true briefly when the peer (Codex companion) delivers an async review
-   * finding via `[System] Inform`. Drives a "peer insight" badge so the operator
-   * sees the peer working concurrently even though it spawns no visible subagents.
+   * Live peer review-gate status, driven by `peer.status` runtime events from the
+   * synchronous fusion gate: the peer reviewing the lead's diff, its verdict, or
+   * that it was unavailable (out of quota). Null when idle.
    */
-  peerInsight: boolean;
+  peerReview: PeerReview | null;
+}
+
+/** Live status of the synchronous fusion review gate for the current turn. */
+export interface PeerReview {
+  state: "reviewing" | "approved" | "suggested_change" | "unavailable";
+  provider?: string;
+  summary?: string;
 }
 
 const MAX_MESSAGES = 500;
@@ -138,7 +145,8 @@ export function useNats(sessionName: string): UseNatsResult {
   const [codexWorking, setCodexWorking] = useState(false);
   const [turnStartedAt, setTurnStartedAt] = useState<number | null>(null);
   const [activeSubagents, setActiveSubagents] = useState<SubagentInfo[]>([]);
-  const [peerInsight, setPeerInsight] = useState(false);
+  const [peerReview, setPeerReview] = useState<PeerReview | null>(null);
+  const peerReviewTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   // Live output-token estimate for the footer meter (chars/4), so it ticks up
   // during the turn instead of freezing on the previous turn's terminal total.
   const [liveTokens, setLiveTokens] = useState(0);
@@ -174,7 +182,7 @@ export function useNats(sessionName: string): UseNatsResult {
     setTurnStartedAt(null);
     setLiveTokens(0);
     setActiveSubagents([]);
-    setPeerInsight(false);
+    setPeerReview(null);
     turnOutChars.current = 0;
     codexStreamBuf.current = "";
 
@@ -352,14 +360,6 @@ export function useNats(sessionName: string): UseNatsResult {
             // Show the clean user text, never the internal fusion playbook prefix.
             const prompt = promptData._displayText ?? promptData.prompt;
             if (!prompt) continue;
-            // An async finding from the peer arrives as a `[System] Inform` from the
-            // peer-companion — pulse the "peer insight" badge so the operator sees
-            // the concurrent reviewer working (it spawns no visible subagents).
-            const rawPrompt = promptData.prompt ?? "";
-            if (rawPrompt.includes("[System] Inform") && rawPrompt.includes("peer-companion-")) {
-              setPeerInsight(true);
-              setTimeout(() => setPeerInsight(false), 6000);
-            }
             // New turn — allow streaming again
             streamDone.current = false;
             streamBuf.current = "";
@@ -512,6 +512,9 @@ export function useNats(sessionName: string): UseNatsResult {
               status?: string;
               usage?: RuntimeFeedUsage;
               provider?: string;
+              state?: string;
+              summary?: string;
+              peerProvider?: string;
               execution?: {
                 provider?: string | null;
                 model?: string | null;
@@ -529,6 +532,17 @@ export function useNats(sessionName: string): UseNatsResult {
             if (runtimeData.type === "assistant" || runtimeData.type === "assistant.message") {
               streamDone.current = false;
               setIsTyping(true);
+            } else if (runtimeData.type === "peer.status") {
+              // Live status from the synchronous fusion review gate. "reviewing"
+              // persists until a verdict replaces it; verdicts/unavailable
+              // auto-clear after a few seconds.
+              const state = runtimeData.state as PeerReview["state"] | undefined;
+              if (state) {
+                if (peerReviewTimer.current) clearTimeout(peerReviewTimer.current);
+                setPeerReview({ state, provider: runtimeData.peerProvider, summary: runtimeData.summary });
+                const ttl = state === "reviewing" ? 6 * 60 * 1000 : 8000;
+                peerReviewTimer.current = setTimeout(() => setPeerReview(null), ttl);
+              }
             } else if (isTerminalRuntimeEvent(runtimeData.type)) {
               // The real turn end. Commit any uncommitted streamed tail (a last
               // block that arrived only via deltas, no `.response`) so it is never
@@ -676,7 +690,7 @@ export function useNats(sessionName: string): UseNatsResult {
     turnStartedAt,
     liveTokens,
     activeSubagents,
-    peerInsight,
+    peerReview,
   };
 }
 

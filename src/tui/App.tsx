@@ -110,7 +110,7 @@ export function App() {
     turnStartedAt,
     liveTokens,
     activeSubagents,
-    peerInsight,
+    peerReview,
   } = useNats(sessionName);
 
   // Cached session/agent/config metadata. Refreshed on `otto.config.changed`
@@ -579,7 +579,7 @@ export function App() {
         remoteLabel={remoteLabel}
         remoteConnected={remoteConnected}
         activeSubagentsCount={activeSubagents.length}
-        peerInsight={peerInsight}
+        peerReview={peerReview}
         onModelClick={() => setModelPickerOpen(true)}
         onFusionClick={toggleFusion}
         onRemoteClick={() => setChannelMenuOpen(true)}

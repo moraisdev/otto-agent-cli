@@ -9,7 +9,6 @@
 
 import type { RuntimeProviderId } from "../runtime/types.js";
 import { logger } from "../utils/logger.js";
-import { companionAgentId } from "./companion-id.js";
 import { ensurePeerCompanion, peerModelFor } from "./companion.js";
 import {
   buildBothExhaustedNotice,
@@ -89,9 +88,8 @@ export async function ensureFusionForTurn(input: EnsureFusionInput): Promise<Fus
     const peerExhausted = peer === "claude" ? state.claudeExhausted : state.codexExhausted;
 
     // Failover: the principal is exhausted but the peer can edit — run this session
-    // under the peer provider as the sole editor. No companion/observer (principal idle).
+    // under the peer provider as the sole editor. No companion (principal idle).
     if (state.editor === peer) {
-      await trySetObserverEnabled(input.leadAgent.id, false);
       return {
         fused: true,
         mode: "failover",
@@ -105,7 +103,6 @@ export async function ensureFusionForTurn(input: EnsureFusionInput): Promise<Fus
     // Degraded solo: the peer is exhausted — the principal works alone this turn
     // (incl. the both-exhausted case: nothing left to fail over to).
     if (peerExhausted) {
-      await trySetObserverEnabled(input.leadAgent.id, false);
       return {
         fused: true,
         mode: "solo",
@@ -114,12 +111,13 @@ export async function ensureFusionForTurn(input: EnsureFusionInput): Promise<Fus
       };
     }
 
-    // Normal: the principal edits, the peer is the always-on read-only reviewer.
+    // Normal: the principal edits, the peer is the read-only reviewer. The review
+    // runs as a SYNCHRONOUS gate at the end of each turn (see runtime/fusion-gate),
+    // so there is no async observer to wire up here — only the companion session.
     // Stable per-agent collaboration id (NOT a per-turn UUID) so the playbook
     // prefix stays identical across turns and the prompt cache keeps hitting.
     const collaborationId = input.mintId ? input.mintId() : `fusion-${input.leadAgent.id}`;
     ensurePeerCompanion(input.leadAgent, peer, principal);
-    await tryEnsureObserverRule(input.leadAgent.id, companionAgentId(input.leadAgent.id), peer);
     return {
       fused: true,
       mode: "normal",
@@ -130,28 +128,5 @@ export async function ensureFusionForTurn(input: EnsureFusionInput): Promise<Fus
     // Never break a turn because fusion setup failed — fall back to solo.
     log.warn("Fusion activation failed; falling back to solo turn", { session: input.leadSessionName, error: err });
     return { fused: false };
-  }
-}
-
-/**
- * The continuous-reviewer wiring lives behind a lazy import so the heavy
- * Observation-Plane module isn't pulled into every entry point's static import
- * graph (faster startup; simpler test mocking). Both helpers are best-effort.
- */
-async function tryEnsureObserverRule(leadAgentId: string, companionId: string, peerProvider: string): Promise<void> {
-  try {
-    const mod = await import("./observer.js");
-    mod.ensureFusionObserverRule({ leadAgentId, companionAgentId: companionId, peerProvider });
-  } catch (err) {
-    log.warn("Continuous-review observer setup skipped", { leadAgentId, error: err });
-  }
-}
-
-async function trySetObserverEnabled(leadAgentId: string, enabled: boolean): Promise<void> {
-  try {
-    const mod = await import("./observer.js");
-    mod.setFusionObserverEnabled(leadAgentId, enabled);
-  } catch {
-    // best-effort; observer is an enhancement, never required for a turn
   }
 }

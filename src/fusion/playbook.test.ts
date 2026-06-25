@@ -45,10 +45,12 @@ describe("fusion playbooks", () => {
     expect(p).not.toContain("GPT/OpenAI access"); // that blurb is codex-peer-only
   });
 
-  it("companion brief is read-only and points informs back at the lead session", () => {
+  it("companion brief is read-only and states the review-gate verdict protocol", () => {
     const b = buildCompanionBrief({ leadSessionName: "agent:main:main", principal: "claude", peer: "codex" });
     expect(b).toContain("READ-ONLY");
-    expect(b).toContain("otto sessions inform agent:main:main");
+    expect(b).toContain("[Fusion Review Request]");
+    expect(b).toContain("VERDICT: APPROVED");
+    expect(b).toContain("VERDICT: CHANGES");
     expect(b).toContain("lead (Claude)");
   });
 
