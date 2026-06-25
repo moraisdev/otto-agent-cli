@@ -23,9 +23,11 @@ const REVIEW_EVENT_TYPES = ["message.assistant", "turn.complete"];
 /**
  * Debounce window for reviews. Delivery is rate-limited rather than fired on
  * every turn so a Codex review -> inform -> Claude reacts -> review cycle can't
- * tight-loop (each round is capped to one review per window).
+ * tight-loop (each round is capped to one review per window). In the async-first
+ * model the peer review is the PRIMARY feedback channel, so keep this short
+ * enough that findings land before the lead has moved far past the reviewed turn.
  */
-const REVIEW_DEBOUNCE_MS = 45_000;
+const REVIEW_DEBOUNCE_MS = 15_000;
 
 export function fusionObserverRuleId(leadAgentId: string): string {
   return `fusion-obs-${leadAgentId}`;

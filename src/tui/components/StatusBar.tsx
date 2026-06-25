@@ -26,6 +26,8 @@ export interface StatusBarProps {
   remoteConnected?: boolean;
   /** Number of `Task` subagents currently in flight (lead + peer combined). */
   activeSubagentsCount?: number;
+  /** Pulses briefly when the peer delivers an async review finding. */
+  peerInsight?: boolean;
   /** Click handlers for the interactive segments. */
   onModelClick?: () => void;
   onFusionClick?: () => void;
@@ -68,6 +70,7 @@ export function StatusBar({
   remoteLabel = "remoto",
   remoteConnected = false,
   activeSubagentsCount = 0,
+  peerInsight = false,
   onModelClick,
   onFusionClick,
   onRemoteClick,
@@ -131,6 +134,7 @@ export function StatusBar({
         ) : null}
         <box flexGrow={1} bg={BG} />
         {codexWorking ? <text content={`${peerProvider} ⟳  `} fg={peerColor} bg={BG} flexShrink={0} /> : null}
+        {peerInsight ? <text content={`✦ ${peerProvider} insight  `} fg={peerColor} bg={BG} flexShrink={0} /> : null}
         {isCompacting ? <text content="compacting  " fg={THEME.working} bg={BG} flexShrink={0} /> : null}
         {ctx > 0 ? <text content={`▦ ${formatTokens(ctx)} `} fg={THEME.dim} bg={BG} flexShrink={0} /> : null}
       </box>

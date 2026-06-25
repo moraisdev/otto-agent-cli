@@ -63,8 +63,11 @@ export function SubagentOverlay({ subagents, onClose }: SubagentOverlayProps) {
       ) : (
         subagents.map((s) => {
           const elapsedSec = Math.max(0, Math.floor((now - s.startedAt) / 1000));
+          // source "codex" is the internal "peer" channel marker — the peer's
+          // provider depends on who leads, so label it provider-neutrally as "peer"
+          // (the lead side is the principal, labeled "lead").
           const sourceColor = s.source === "codex" ? THEME.codex : THEME.claude;
-          const sourceLabel = s.source === "codex" ? "codex" : "claude";
+          const sourceLabel = s.source === "codex" ? "peer" : "lead";
           const desc = s.description.length > 40 ? `${s.description.slice(0, 39)}…` : s.description;
           return (
             <box key={s.toolId} flexDirection="row" bg="black">

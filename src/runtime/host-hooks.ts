@@ -2,7 +2,6 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { requestCascadingApproval, requestPollAnswer, type ApprovalTarget } from "../approval/service.js";
 import { createBashPermissionHook, createToolPermissionHook } from "../bash/index.js";
-import { createFusionConsultNudgeHook } from "../hooks/fusion-consult-nudge.js";
 import { createPreCompactHook } from "../hooks/index.js";
 import { createSanitizeBashHook } from "../hooks/sanitize-bash.js";
 import { nats } from "../nats.js";
@@ -84,7 +83,6 @@ export function createRuntimeHostHooks({
 
   hooks.PreToolUse = [
     ...(hooks.PreToolUse ?? []),
-    createFusionConsultNudgeHook({ agentId: agent.id, sessionName }),
     { hooks: [createSpecBlockHook(sessionName)] },
     {
       matcher: "mcp__spec__exit_spec_mode",
