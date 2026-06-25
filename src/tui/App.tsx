@@ -568,7 +568,6 @@ export function App() {
         agentId={agentId}
         isConnected={isConnected}
         runtimeLabel={runtimeLabel}
-        isTyping={isTyping}
         isCompacting={isCompacting}
         totalTokens={totalTokens}
         fusionEnabled={fusionEnabled}

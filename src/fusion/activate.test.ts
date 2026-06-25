@@ -47,13 +47,12 @@ describe("ensureFusionForTurn", () => {
     const plan = await ensureFusionForTurn({
       leadAgent: lead,
       leadSessionName: "agent:main:main",
-      mintId: () => "collab-1",
     });
     expect(plan.fused).toBe(true);
     expect(plan.mode).toBe("normal");
     expect(plan.editor).toBe("claude");
     expect(plan.runtimeProviderId).toBeUndefined();
-    expect(plan.playbookPrefix).toContain("collaboration collab-1");
+    expect(plan.playbookPrefix).toContain("collaboration fusion-main");
     // Peer companion agent was provisioned (Codex peer when Claude leads).
     expect(dbGetAgent("peer-companion-main")?.provider).toBe("codex");
   });
@@ -104,7 +103,6 @@ describe("ensureFusionForTurn", () => {
     const plan = await ensureFusionForTurn({
       leadAgent: codexLead,
       leadSessionName: "agent:main:main",
-      mintId: () => "c2",
     });
     expect(plan.fused).toBe(true);
     expect(plan.mode).toBe("normal");

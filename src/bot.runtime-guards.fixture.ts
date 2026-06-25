@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock, setDefaultTimeout } from "bun:test";
+import { setFusionDisabled } from "./fusion/state.js";
 import { cleanupIsolatedOttoState, createIsolatedOttoState } from "./test/otto-state.js";
 
 afterAll(() => mock.restore());
@@ -1374,6 +1375,10 @@ describe("OttoBot runtime guards", () => {
 
   it("does not emit legacy .claude events for Codex sessions", async () => {
     activeProvider = "codex";
+    // This guard checks raw Codex emission (no legacy .claude, provider.raw +
+    // stream present). Run it solo (fusion off) so the lead draft streams — a
+    // fused lead turn deliberately holds the draft until the review gate.
+    setFusionDisabled("main", true);
     const sessionKey = "agent:main:codex-no-legacy-feed";
 
     runtimeStartImpl = (providerId) => ({

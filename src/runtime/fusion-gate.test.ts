@@ -7,9 +7,7 @@ import {
 } from "./fusion-gate.js";
 
 const baseReq: FusionReviewRequest = {
-  leadSessionName: "agent:main:main",
   leadAgentId: "main",
-  peerProvider: "codex",
   draft: "Added the function and a test.",
   round: 0,
 };
@@ -71,7 +69,7 @@ describe("runFusionReviewGate", () => {
       },
     });
     expect(published[0]?.sessionName).toBe("agent:peer-companion-main:main");
-    expect(published[0]?.payload._fusionReview).toBe(true);
+    expect(typeof published[0]?.payload.prompt).toBe("string");
     expect(verdict.outcome).toBe("changes");
     expect(verdict.summary).toBe("1 ajuste");
   });

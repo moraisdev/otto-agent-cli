@@ -45,7 +45,13 @@ const answerBubble = (id: string, content: string, streaming?: boolean): ChatMes
  */
 export function ChatView({ messages, working, leadName, peerName, peerReview }: ChatViewProps) {
   const scrollRef = useRef<ScrollBoxRenderable>(null);
-  const nodes = groupTimeline(messages, { working, leadName, peerName });
+  // The peer keeps the turn "in flight" while it is evaluating the approach or
+  // reviewing the diff — even after the lead's own turn.complete — so the tree
+  // shows the live peer phase instead of flipping to "concluído" too early.
+  const peerActive = peerReview?.state === "evaluating" || peerReview?.state === "reviewing";
+  const nodes = groupTimeline(messages, { working: working || peerActive, leadName, peerName });
+  // peerReview is always about the CURRENT turn — only the last turn node shows it.
+  const lastTurnId = [...nodes].reverse().find((n) => n.kind === "turn")?.id;
 
   // Auto-scroll to bottom when the rendered node count changes.
   useEffect(() => {
@@ -86,7 +92,7 @@ export function ChatView({ messages, working, leadName, peerName, peerReview }: 
           ? null
           : nodes.map((node) => {
               if (node.kind === "turn") {
-                return <TurnGroup key={node.id} turn={node} peerReview={peerReview} />;
+                return <TurnGroup key={node.id} turn={node} peerReview={node.id === lastTurnId ? peerReview : null} />;
               }
               if (node.kind === "user") {
                 return <MessageBubble key={node.id} message={userBubble(node.id, node.content)} />;

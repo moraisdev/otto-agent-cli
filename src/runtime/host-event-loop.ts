@@ -1,6 +1,7 @@
 import { calculateCost } from "../constants.js";
 import { backfillProviderSessionId, saveMessage } from "../db.js";
 import { HEARTBEAT_OK } from "../heartbeat/index.js";
+import { isPeerConsultCommand } from "../fusion/companion-id.js";
 import { recordTurnFailureForFusion, recordTurnSuccessForFusion } from "../fusion/failover.js";
 import { shouldFuseSession } from "../fusion/policy.js";
 import { getEffectiveFusionState, isFusionDisabled, otherProvider, type FusionProvider } from "../fusion/state.js";
@@ -345,6 +346,20 @@ export async function runRuntimeEventLoop(options: RunRuntimeEventLoopOptions): 
   // the current turn has already gone through.
   let turnTouchedFiles = false;
   let fusionReviewRound = 0;
+  // Tool id of an in-flight peer consult (the lead's blocking `otto sessions send
+  // <peer> -w`), so the peer's "avaliando…" status clears when the consult ends.
+  let peerConsultToolId: string | undefined;
+  // The principal (configured lead) provider; the peer is the other one.
+  const principalProvider: FusionProvider = agent.provider === "codex" ? "codex" : "claude";
+  // True when THIS turn is a fused lead turn (principal editing, fusion on, not a
+  // companion/sentinel/automation session, not a failover-to-peer turn). When true
+  // the lead's reply is HELD (not streamed/shipped inline) until the review gate at
+  // turn.complete decides — so the user only ever sees the final, reviewed answer.
+  const isFusionLeadTurn = (): boolean =>
+    streaming.agentMode !== "sentinel" &&
+    runtimeSession.provider === principalProvider &&
+    shouldFuseSession({ sessionName, agentId: agent.id }) &&
+    !isFusionDisabled(agent.id);
   let restartStashedReason: string | undefined;
   const observationEvents: ObservationEvent[] = [];
   const debouncedObservationEvents: ObservationEvent[] = [];
@@ -689,7 +704,12 @@ export async function runRuntimeEventLoop(options: RunRuntimeEventLoopOptions): 
           model,
           source: streaming.currentSource,
         });
-        queueChunkEmit(event.text, event.metadata);
+        // On a fused lead turn the draft is HELD until the peer review gate — don't
+        // stream it to the user (the activity tree shows progress instead). The
+        // single reviewed answer is emitted at turn.complete.
+        if (!isFusionLeadTurn()) {
+          queueChunkEmit(event.text, event.metadata);
+        }
         continue;
       }
 
@@ -785,6 +805,17 @@ export async function runRuntimeEventLoop(options: RunRuntimeEventLoopOptions): 
         streaming.toolRunning = true;
         if (FILE_MUTATING_TOOLS.has(event.toolUse.name)) {
           turnTouchedFiles = true;
+        }
+        // Surface the converge consult as live peer status ("avaliando…") so the
+        // tree shows the peer evaluating the approach, distinct from "revisando…".
+        if (
+          event.toolUse.name === "Bash" &&
+          isPeerConsultCommand(String((event.toolUse.input as { command?: unknown })?.command ?? "")) &&
+          shouldFuseSession({ sessionName, agentId: agent.id })
+        ) {
+          peerConsultToolId = event.toolUse.id;
+          const peer = otherProvider(agent.provider === "codex" ? "codex" : "claude");
+          await emitRuntimeEvent({ type: "peer.status", state: "evaluating", peerProvider: peer }).catch(() => {});
         }
         streaming.currentToolId = event.toolUse.id;
         streaming.currentToolName = event.toolUse.name;
@@ -965,7 +996,12 @@ export async function runRuntimeEventLoop(options: RunRuntimeEventLoopOptions): 
                 model,
                 source: streaming.currentSource,
               });
-              await emitResponse(messageText, event.metadata);
+              // On a fused lead turn, HOLD the reply (accumulated in responseText)
+              // and emit it once at turn.complete after the review gate approves —
+              // so the user never sees an unreviewed draft or a double reply.
+              if (!isFusionLeadTurn()) {
+                await emitResponse(messageText, event.metadata);
+              }
             }
           }
         }
@@ -990,6 +1026,11 @@ export async function runRuntimeEventLoop(options: RunRuntimeEventLoopOptions): 
         const toolId = streaming.currentToolId ?? event.toolUseId ?? "unknown";
         const toolName = streaming.currentToolName ?? event.toolName ?? "unknown";
         const toolInput = streaming.currentToolInput;
+        // The converge consult finished — clear the peer's "avaliando…" status.
+        if (peerConsultToolId && toolId === peerConsultToolId) {
+          peerConsultToolId = undefined;
+          await emitRuntimeEvent({ type: "peer.status", state: "idle" }).catch(() => {});
+        }
         const output = truncateOutput(event.content);
         ensureCurrentTurnUserObservation();
         pushObservationEvent("tool.end", {
@@ -1300,42 +1341,44 @@ export async function runRuntimeEventLoop(options: RunRuntimeEventLoopOptions): 
         }
 
         // ── Fusion review gate ───────────────────────────────────────────
-        // Hold the turn until the read-only peer has reviewed the lead's real
-        // diff, turning the review from a rearview mirror into a windshield. The
-        // consult is routed through the peer companion's MAIN session (which the
-        // TUI watches), so the user sees the peer reviewing live. Fails OPEN: a
-        // slow / absent / exhausted peer never wedges the reply.
+        // On a fused lead turn the reply was HELD (not streamed/shipped). Run the
+        // synchronous peer review here, then emit the SINGLE reviewed answer. On a
+        // "changes" verdict the lead revises as a continuation and the revised
+        // answer ships next round — never a draft+revision double-ship. The consult
+        // runs in the peer companion's MAIN session (the TUI watches it), and fails
+        // OPEN: a slow / absent / exhausted peer never wedges the reply.
         {
           const draft = responseText.trim();
-          const principal: FusionProvider = agent.provider === "codex" ? "codex" : "claude";
-          const peerProvider = otherProvider(principal);
-          const fusionState = getEffectiveFusionState(agent.id, principal);
+          const peerProvider = otherProvider(principalProvider);
+          const fusionState = getEffectiveFusionState(agent.id, principalProvider);
           const peerExhausted = peerProvider === "codex" ? fusionState.codexExhausted : fusionState.claudeExhausted;
-          const failoverActive = runtimeSession.provider !== principal;
-          const gateEligible =
-            !streaming.interrupted &&
-            draft.length > 0 &&
-            turnTouchedFiles &&
-            streaming.agentMode !== "sentinel" &&
-            shouldFuseSession({ sessionName, agentId: agent.id }) &&
-            !isFusionDisabled(agent.id) &&
-            !failoverActive;
+          const fusionLead = isFusionLeadTurn();
+          // Ship the held draft as the single user-facing reply. No-op for
+          // non-fused turns (already emitted inline) or when there is nothing to
+          // say / the turn was interrupted.
+          const shipHeldDraft = async () => {
+            if (fusionLead && draft && !streaming.interrupted) {
+              await emitResponse(draft, event.metadata);
+            }
+          };
 
-          if (gateEligible && peerExhausted) {
-            // Peer at quota — ship solo with a notice instead of blocking.
+          if (!fusionLead) {
             fusionReviewRound = 0;
-            await emitRuntimeEvent({ type: "peer.status", state: "unavailable", peerProvider, note: "sem cota" }).catch(
-              () => {},
-            );
-          } else if (gateEligible) {
+          } else if (!draft || !turnTouchedFiles || peerExhausted) {
+            // Fused but no review to run: pure Q&A, no edits, or peer at quota.
+            fusionReviewRound = 0;
+            if (peerExhausted && draft && turnTouchedFiles) {
+              await emitRuntimeEvent({
+                type: "peer.status",
+                state: "unavailable",
+                peerProvider,
+                note: "sem cota",
+              }).catch(() => {});
+            }
+            await shipHeldDraft();
+          } else {
             await emitRuntimeEvent({ type: "peer.status", state: "reviewing", peerProvider }).catch(() => {});
-            const verdict = await runFusionReviewGate({
-              leadSessionName: sessionName,
-              leadAgentId: agent.id,
-              peerProvider,
-              draft,
-              round: fusionReviewRound,
-            });
+            const verdict = await runFusionReviewGate({ leadAgentId: agent.id, draft, round: fusionReviewRound });
             if (verdict.outcome === "changes" && fusionReviewRound < FUSION_REVIEW_MAX_ROUNDS - 1) {
               fusionReviewRound += 1;
               await emitRuntimeEvent({
@@ -1345,7 +1388,7 @@ export async function runRuntimeEventLoop(options: RunRuntimeEventLoopOptions): 
                 ...(verdict.summary ? { summary: verdict.summary } : {}),
               }).catch(() => {});
               // Re-prompt the lead with the findings as a continuation of this
-              // turn — the revised reply is what finally ships.
+              // turn — the revised, approved reply is what finally ships.
               const peerName = peerProvider === "codex" ? "Codex" : "Claude";
               streaming.pendingMessages.push(
                 createQueuedRuntimeUserMessage({
@@ -1372,15 +1415,15 @@ export async function runRuntimeEventLoop(options: RunRuntimeEventLoopOptions): 
                 peerProvider,
                 ...(verdict.summary ? { summary: verdict.summary } : {}),
               }).catch(() => {});
+              await shipHeldDraft();
             }
-          } else {
-            fusionReviewRound = 0;
           }
         }
 
         // Reset for next turn
         responseText = "";
         turnTouchedFiles = false;
+        peerConsultToolId = undefined;
         streaming.convergeConsultedThisTurn = false;
         streaming.convergeDenyCount = 0;
         clearActiveToolState();
@@ -1426,8 +1469,13 @@ export async function runRuntimeEventLoop(options: RunRuntimeEventLoopOptions): 
         streaming.interrupted = true;
         responseText = "";
         turnTouchedFiles = false;
+        fusionReviewRound = 0;
         streaming.convergeConsultedThisTurn = false;
         streaming.convergeDenyCount = 0;
+        if (peerConsultToolId) {
+          peerConsultToolId = undefined;
+          await emitRuntimeEvent({ type: "peer.status", state: "idle" }).catch(() => {});
+        }
         clearActiveToolState();
         streaming.compacting = false;
         streaming.lastToolFailure = undefined;
@@ -1552,8 +1600,13 @@ export async function runRuntimeEventLoop(options: RunRuntimeEventLoopOptions): 
         });
 
         turnTouchedFiles = false;
+        fusionReviewRound = 0;
         streaming.convergeConsultedThisTurn = false;
         streaming.convergeDenyCount = 0;
+        if (peerConsultToolId) {
+          peerConsultToolId = undefined;
+          await emitRuntimeEvent({ type: "peer.status", state: "idle" }).catch(() => {});
+        }
         signalTurnComplete();
       }
     }

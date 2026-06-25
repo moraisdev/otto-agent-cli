@@ -45,7 +45,6 @@ export interface FusionTurnPlan {
 export interface EnsureFusionInput {
   leadAgent: { id: string; cwd: string; provider?: string | null };
   leadSessionName: string;
-  mintId?: () => string;
   now?: number;
 }
 
@@ -116,7 +115,7 @@ export async function ensureFusionForTurn(input: EnsureFusionInput): Promise<Fus
     // so there is no async observer to wire up here — only the companion session.
     // Stable per-agent collaboration id (NOT a per-turn UUID) so the playbook
     // prefix stays identical across turns and the prompt cache keeps hitting.
-    const collaborationId = input.mintId ? input.mintId() : `fusion-${input.leadAgent.id}`;
+    const collaborationId = `fusion-${input.leadAgent.id}`;
     ensurePeerCompanion(input.leadAgent, peer, principal);
     return {
       fused: true,

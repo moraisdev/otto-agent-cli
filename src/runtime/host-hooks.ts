@@ -2,7 +2,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { requestCascadingApproval, requestPollAnswer, type ApprovalTarget } from "../approval/service.js";
 import { createBashPermissionHook, createToolPermissionHook } from "../bash/index.js";
-import { companionAgentId, companionSessionKey } from "../fusion/companion-id.js";
+import { companionAgentId, companionSessionKey, isPeerConsultCommand } from "../fusion/companion-id.js";
 import { shouldFuseSession } from "../fusion/policy.js";
 import { getEffectiveFusionState, isFusionDisabled, otherProvider, type FusionProvider } from "../fusion/state.js";
 import { createPreCompactHook } from "../hooks/index.js";
@@ -150,11 +150,7 @@ function createConvergeGateHook(options: {
     // Record the converge consult itself and always let Bash through.
     if (toolName === "Bash") {
       const command = (input?.tool_input?.command as string) ?? "";
-      const isConsult =
-        /\botto\s+sessions\s+send\b/.test(command) &&
-        /(^|\s)(-w|--wait)(\s|$)/.test(command) &&
-        command.includes(companionKey);
-      if (isConsult) streamingSession.convergeConsultedThisTurn = true;
+      if (isPeerConsultCommand(command)) streamingSession.convergeConsultedThisTurn = true;
       return {};
     }
 

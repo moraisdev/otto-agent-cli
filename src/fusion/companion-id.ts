@@ -26,3 +26,16 @@ export function companionAgentId(leadId: string): string {
 export function companionSessionKey(companionId: string): string {
   return `agent:${companionId}:main`;
 }
+
+/**
+ * True when a Bash command is the lead's blocking peer consult
+ * (`otto sessions send <peer-companion-*> ... -w`). Used both to enforce the
+ * converge gate and to surface "avaliando…" peer status during the consult.
+ */
+export function isPeerConsultCommand(command: string): boolean {
+  return (
+    /\botto\s+sessions\s+send\b/.test(command) &&
+    /(^|\s)(-w|--wait)(\s|$)/.test(command) &&
+    command.includes(COMPANION_AGENT_PREFIX)
+  );
+}

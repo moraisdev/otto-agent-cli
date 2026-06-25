@@ -99,19 +99,24 @@ It fires automatically from every interactive entry point — WhatsApp/omni
 (`obs:*`) sessions, isolated automation (`:cron:` / `:trigger:`) sessions, and non-Claude-led
 agents (see `src/fusion/policy.ts`).
 
-What happens each normal turn (all on Otto primitives — agents, REBAC, sessions, observers).
-The model is **async-first**: the lead works at solo speed and the peer reviews concurrently —
-it is NOT on the lead's critical path.
-1. A read-only peer companion (`peer-companion-<leadId>`, the non-principal provider, same cwd)
-   is ensured and granted a read-only tool set; its consultant brief is persisted as the agent's
+What happens each normal turn (all on Otto primitives — agents, REBAC, sessions, hooks). The model
+is **continuous pairing**: the lead and the peer decide together and finish together — the lead does
+NOT act alone.
+1. A read-only peer companion (`peer-companion-<leadId>`, the non-principal provider, same cwd) is
+   ensured and granted a read-only tool set; its pairing brief is persisted as the agent's
    `systemPromptAppend`.
-2. An Observation-Plane rule (`fusion-obs-<leadId>`, `report`/`debounce` ~15s) is registered so the
-   peer reviews the lead's completed turns in the background and proactively `otto sessions inform`s
-   findings — the PRIMARY (async) feedback channel.
-3. The lead turn is prefixed with the fusion playbook; the lead implements at full speed and folds in
-   the peer's async informs on the next turn. Only occasionally (a hard fork) does it issue a lean
-   synchronous consult `otto sessions send agent:peer-companion-<leadId>:main "..." -w` — the
-   exception, not the default.
+2. CONVERGE (enforced): a PreToolUse converge gate (`createConvergeGateHook` in
+   `src/runtime/host-hooks.ts`) blocks the lead's file-mutating edits until it has run a blocking peer
+   consult (`otto sessions send agent:peer-companion-<leadId>:main "..." -w`) this turn — so the
+   approach is agreed with the peer before any code is written. Skipped when fusion is off, the peer is
+   exhausted, or the session is sentinel; fails open after a few denies so it never wedges.
+3. IMPLEMENT, then REVIEW LOOP: at `turn.complete` the lead's reply is HELD (not streamed or shipped)
+   while the synchronous review gate (`runFusionReviewGate` in `src/runtime/fusion-gate.ts`) consults
+   the peer over the real diff; on `CHANGES` the lead revises as a continuation and the peer
+   re-reviews, looping until it approves (up to `FUSION_REVIEW_MAX_ROUNDS`). Only the final, approved
+   reply is emitted — never a draft+revision double-ship. The review runs in the companion's MAIN
+   session and surfaces as live `peer.status` events (`evaluating`/`reviewing`/`approved`/
+   `suggested_change`) the TUI renders in the activity tree.
 
 ### Failover (provider quota)
 
@@ -122,7 +127,7 @@ and recorded per-agent in the `fusion_state` table (`src/fusion/state.ts`), with
 - **Claude exhausted →** the session runs under **Codex** as the sole editor for the next
   turns (the prompt carries `_runtimeProviderId: "codex"` + `_fusion`, honored by
   `src/runtime/session-resolver.ts`). Codex finishes the work; Claude resumes when its quota
-  resets. No companion/observer (Claude is idle).
+  resets. No companion (Claude is idle).
 - **Codex exhausted →** Claude works **solo** (the reviewer is paused) until Codex returns.
 
 **Read-only status (normal mode):** the companion's REBAC profile grants read/analysis tools

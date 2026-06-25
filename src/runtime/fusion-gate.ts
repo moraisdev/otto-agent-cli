@@ -12,7 +12,6 @@
  */
 
 import { companionAgentId, companionSessionKey } from "../fusion/companion-id.js";
-import type { FusionProvider } from "../fusion/state.js";
 import { subscribe } from "../nats.js";
 import { publishSessionPrompt } from "../omni/session-stream.js";
 import { logger } from "../utils/logger.js";
@@ -43,9 +42,7 @@ export interface FusionReviewVerdict {
 }
 
 export interface FusionReviewRequest {
-  leadSessionName: string;
   leadAgentId: string;
-  peerProvider: FusionProvider;
   /** The lead's draft reply that the peer reviews. */
   draft: string;
   /** 0-based review round (0 = first review of the turn). */
@@ -131,10 +128,7 @@ export async function runFusionReviewGate(
   });
 
   try {
-    await publishPrompt(companionKey, {
-      prompt: buildReviewRequestPrompt(req),
-      _fusionReview: true,
-    });
+    await publishPrompt(companionKey, { prompt: buildReviewRequestPrompt(req) });
     for (;;) {
       const next = await Promise.race([iterator.next(), timeout]);
       if (next === "timeout") {

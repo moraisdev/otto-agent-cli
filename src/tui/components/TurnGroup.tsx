@@ -20,9 +20,11 @@ function partColor(source: string): string {
   return source === "codex" ? THEME.codex : THEME.claude;
 }
 
-/** Maps the peer review-gate state to the peer row's status line. */
+/** Maps the live peer state to the peer row's status line. */
 function peerReviewLabel(pr: PeerReview): { text: string; color: string } {
   switch (pr.state) {
+    case "evaluating":
+      return { text: "avaliando…", color: THEME.working };
     case "reviewing":
       return { text: "revisando…", color: THEME.working };
     case "approved":
@@ -101,9 +103,10 @@ function ParticipantRow({
   const [openSteps, setOpenSteps] = useState<Set<string>>(() => new Set());
   const branch = last ? "└" : "├";
   const stem = last ? "    " : "│   ";
-  // The peer's row reflects the live review gate (revisando…/✓ revisado/✦ ajustes)
-  // while the turn is active; otherwise the generic working/Done status.
-  const review = peerReview && p.source === "codex" && working ? peerReviewLabel(peerReview) : null;
+  // The peer's row reflects its live phase (avaliando…/revisando…) and the verdict
+  // (✓ revisado/✦ ajustes) — shown for the peer on the current turn, even just
+  // after it finishes; otherwise the generic working/Done status.
+  const review = peerReview && p.source === "codex" ? peerReviewLabel(peerReview) : null;
   const status = review ? review.text : working ? "trabalhando" : "Done";
   const statusColor = review ? review.color : working ? THEME.working : THEME.done;
 

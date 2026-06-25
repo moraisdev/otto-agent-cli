@@ -98,9 +98,10 @@ export interface UseNatsResult {
   peerReview: PeerReview | null;
 }
 
-/** Live status of the synchronous fusion review gate for the current turn. */
+/** Live status of the fusion peer for the current turn. `evaluating` = converge
+ * consult (peer weighing the approach); `reviewing` = end-of-turn diff review. */
 export interface PeerReview {
-  state: "reviewing" | "approved" | "suggested_change" | "unavailable";
+  state: "evaluating" | "reviewing" | "approved" | "suggested_change" | "unavailable";
   provider?: string;
   summary?: string;
 }
@@ -358,6 +359,10 @@ export function useNats(sessionName: string): UseNatsResult {
             setTurnStartedAt(Date.now());
             setLiveTokens(0);
             turnOutChars.current = 0;
+            // Drop any peer review state from the previous turn so a fresh turn
+            // never shows a stale verdict.
+            if (peerReviewTimer.current) clearTimeout(peerReviewTimer.current);
+            setPeerReview(null);
             // Cancel BOTH in-flight stream flushes and drop any lingering
             // streaming placeholders from a prior turn that never finalized —
             // otherwise the new turn's deltas write into the old bubble (the
@@ -451,6 +456,9 @@ export function useNats(sessionName: string): UseNatsResult {
               // Tool starting — clear any streaming message and buffer.
               // Also drop "thinking" state so the meter reads "working" during tools.
               setIsTyping(false);
+              // Lead activity ⇒ the turn is in flight — covers fusion revision
+              // rounds, which continue in-process without a fresh `.prompt`.
+              setIsWorking(true);
               streamBuf.current = "";
               if (toolData.toolName === "Task") {
                 const taskInput = (toolData.input ?? {}) as Record<string, unknown>;
@@ -522,16 +530,19 @@ export function useNats(sessionName: string): UseNatsResult {
             if (runtimeData.type === "assistant" || runtimeData.type === "assistant.message") {
               streamDone.current = false;
               setIsTyping(true);
+              setIsWorking(true);
             } else if (runtimeData.type === "peer.status") {
-              // Live status from the synchronous fusion review gate. "reviewing"
-              // persists until a verdict replaces it; verdicts/unavailable
-              // auto-clear after a few seconds.
-              const state = runtimeData.state as PeerReview["state"] | undefined;
-              if (state) {
-                if (peerReviewTimer.current) clearTimeout(peerReviewTimer.current);
+              // Live fusion peer status. Active phases ("evaluating"/"reviewing")
+              // persist until cleared by their own end signal; verdicts auto-clear
+              // after a few seconds; "idle" clears immediately.
+              if (peerReviewTimer.current) clearTimeout(peerReviewTimer.current);
+              const state = runtimeData.state as PeerReview["state"] | "idle" | undefined;
+              if (!state || state === "idle") {
+                setPeerReview(null);
+              } else {
                 setPeerReview({ state, provider: runtimeData.peerProvider, summary: runtimeData.summary });
-                const ttl = state === "reviewing" ? 6 * 60 * 1000 : 8000;
-                peerReviewTimer.current = setTimeout(() => setPeerReview(null), ttl);
+                const active = state === "reviewing" || state === "evaluating";
+                peerReviewTimer.current = setTimeout(() => setPeerReview(null), active ? 6 * 60 * 1000 : 8000);
               }
             } else if (isTerminalRuntimeEvent(runtimeData.type)) {
               // The real turn end. Commit any uncommitted streamed tail (a last
@@ -545,6 +556,11 @@ export function useNats(sessionName: string): UseNatsResult {
               setIsCompacting(false);
               setIsWorking(false);
               setTurnStartedAt(null);
+              // Retire any lingering peer phase (e.g. a lost "avaliando…" idle) at
+              // the real turn end; the review gate re-emits "reviewing" right after
+              // if it runs.
+              if (peerReviewTimer.current) clearTimeout(peerReviewTimer.current);
+              setPeerReview(null);
               setMessages((prev) => {
                 const filtered = prev.filter((m) => m.id !== STREAMING_ID);
                 if (!tail.trim()) return filtered;
@@ -604,6 +620,10 @@ export function useNats(sessionName: string): UseNatsResult {
       streamFlush.current = null;
       codexStreamFlush.current?.cancel();
       codexStreamFlush.current = null;
+      if (peerReviewTimer.current) {
+        clearTimeout(peerReviewTimer.current);
+        peerReviewTimer.current = undefined;
+      }
       setIsConnected(false);
     };
   }, [sessionName]);
@@ -660,6 +680,11 @@ export function useNats(sessionName: string): UseNatsResult {
     setIsWorking(false);
     setIsTyping(false);
     setTurnStartedAt(null);
+    if (peerReviewTimer.current) {
+      clearTimeout(peerReviewTimer.current);
+      peerReviewTimer.current = undefined;
+    }
+    setPeerReview(null);
     // Remove in-progress streaming message
     setMessages((prev) => prev.filter((m) => m.id !== STREAMING_ID));
   }, []);

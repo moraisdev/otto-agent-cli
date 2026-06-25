@@ -9,7 +9,6 @@ export interface StatusBarProps {
   agentId: string;
   isConnected: boolean;
   runtimeLabel: RuntimeDisplayLabel;
-  isTyping: boolean;
   isCompacting: boolean;
   totalTokens: TokenUsage;
   /** Whether fusion (principal + peer) is on for this session's agent. */
@@ -51,14 +50,15 @@ function formatTokens(n: number): string {
  * Fixed-height status bar (footer).
  *
  *   Left:  session: <name> · claude/opus + codex/gpt-5.5 · fusion state · where
- *   Right: peer activity · compacting · context tokens · connection dot
+ *   Right: compacting · context tokens · connection dot
+ *
+ * Live peer/fusion activity lives in the chat activity tree (TurnGroup), not here.
  */
 export function StatusBar({
   sessionName,
   agentId,
   isConnected,
   runtimeLabel,
-  isTyping: _isTyping,
   isCompacting,
   totalTokens,
   fusionEnabled = true,
@@ -89,7 +89,7 @@ export function StatusBar({
   // cleanly at the edge instead of the two groups overlapping into garbage.
   // 2×2 grid: a fixed-width left column keeps the two rows aligned.
   //   row 1:  session: <name>       model (+ peer)               ● dot
-  //   row 2:  ● fusion              remoto / ● whatsapp          ▦ ctx · peer⟳
+  //   row 2:  ● fusion              remoto / ● whatsapp · agents  ▦ ctx
   return (
     <box flexDirection="column" width="100%" height={2} flexShrink={0} bg={BG}>
       {/* row 1 */}
