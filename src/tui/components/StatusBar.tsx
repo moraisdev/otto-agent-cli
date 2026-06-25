@@ -24,11 +24,14 @@ export interface StatusBarProps {
   remoteLabel?: string;
   /** Whether any remote channel is connected (drives the ● + color). */
   remoteConnected?: boolean;
+  /** Number of `Task` subagents currently in flight (lead + peer combined). */
+  activeSubagentsCount?: number;
   /** Click handlers for the interactive segments. */
   onModelClick?: () => void;
   onFusionClick?: () => void;
   onRemoteClick?: () => void;
-  /** Keyboard-focused segment: null=none, 0=model, 1=fusion, 2=remote. */
+  onAgentsClick?: () => void;
+  /** Keyboard-focused segment: null=none, 0=model, 1=fusion, 2=remote, 3=agents. */
   focusIndex?: number | null;
 }
 
@@ -64,9 +67,11 @@ export function StatusBar({
   companionModel,
   remoteLabel = "remoto",
   remoteConnected = false,
+  activeSubagentsCount = 0,
   onModelClick,
   onFusionClick,
   onRemoteClick,
+  onAgentsClick,
   focusIndex = null,
 }: StatusBarProps) {
   const statusDot = isConnected ? "●" : "○";
@@ -119,6 +124,11 @@ export function StatusBar({
             bg={focusBg(2)}
           />
         </box>
+        {activeSubagentsCount > 0 ? (
+          <box onClick={onAgentsClick} bg={focusBg(3)} flexShrink={0}>
+            <text content={` · agents · ${activeSubagentsCount}`} fg={focusFg(3, THEME.working)} bg={focusBg(3)} />
+          </box>
+        ) : null}
         <box flexGrow={1} bg={BG} />
         {codexWorking ? <text content={`${peerProvider} ⟳  `} fg={peerColor} bg={BG} flexShrink={0} /> : null}
         {isCompacting ? <text content="compacting  " fg={THEME.working} bg={BG} flexShrink={0} /> : null}

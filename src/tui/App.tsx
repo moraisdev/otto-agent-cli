@@ -13,6 +13,7 @@ import { ConnectStatusLine } from "./components/ConnectStatusLine.js";
 import { InputBar } from "./components/InputBar.js";
 import { ModelPicker } from "./components/ModelPicker.js";
 import { QrOverlay } from "./components/QrOverlay.js";
+import { SubagentOverlay } from "./components/SubagentOverlay.js";
 import { ChannelMenu } from "./components/ChannelMenu.js";
 import { SessionPicker } from "./components/SessionPicker.js";
 import { StatusBar } from "./components/StatusBar.js";
@@ -102,6 +103,7 @@ export function App() {
     codexWorking,
     turnStartedAt,
     liveTokens,
+    activeSubagents,
   } = useNats(sessionName);
 
   // Cached session/agent/config metadata. Refreshed on `otto.config.changed`
@@ -117,6 +119,7 @@ export function App() {
   // Fusion on/off for this session's agent.
   const [fusionEnabled, setFusionEnabled] = useState(true);
   const [channelMenuOpen, setChannelMenuOpen] = useState(false);
+  const [subagentOverlayOpen, setSubagentOverlayOpen] = useState(false);
   // Status-bar keyboard focus: null = input focused; 0=model, 1=fusion, 2=remote.
   const [statusFocus, setStatusFocus] = useState<number | null>(null);
   useEffect(() => {
@@ -552,9 +555,11 @@ export function App() {
         companionModel={fusionEnabled ? peerModel : null}
         remoteLabel={remoteLabel}
         remoteConnected={remoteConnected}
+        activeSubagentsCount={activeSubagents.length}
         onModelClick={() => setModelPickerOpen(true)}
         onFusionClick={toggleFusion}
         onRemoteClick={() => setChannelMenuOpen(true)}
+        onAgentsClick={() => setSubagentOverlayOpen(true)}
         focusIndex={statusFocus}
       />
 
@@ -643,6 +648,23 @@ export function App() {
             zIndex={99}
           />
           <QrOverlay qr={ch.qr} onClose={ch.dismiss} />
+        </>
+      )}
+
+      {subagentOverlayOpen && (
+        <>
+          <box
+            position="absolute"
+            top={0}
+            left={0}
+            width="100%"
+            height="100%"
+            backgroundColor="black"
+            shouldFill
+            opacity={0.5}
+            zIndex={99}
+          />
+          <SubagentOverlay subagents={activeSubagents} onClose={() => setSubagentOverlayOpen(false)} />
         </>
       )}
     </box>

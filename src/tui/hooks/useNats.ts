@@ -47,6 +47,23 @@ export interface TokenUsage {
   contextTokens: number;
 }
 
+/**
+ * A Task-tool spawn currently in flight. The TUI tracks these so the operator
+ * can see how many subagents are running and what they're doing without having
+ * to scroll the timeline. Cleared as soon as the matching tool `end` event lands.
+ */
+export interface SubagentInfo {
+  toolId: string;
+  /** Which side spawned it — colors the entry in the overlay. */
+  source: EntrySource;
+  /** The agent type passed to the Task tool (e.g. "general-purpose", "Explore"). */
+  subagentType: string;
+  /** Short human-readable description from the Task call. */
+  description: string;
+  /** When the spawn started, for the live duration counter. */
+  startedAt: number;
+}
+
 export interface RuntimeDisplayInfo {
   provider: "claude" | "codex" | null;
   executionModel: string | null;
@@ -70,6 +87,11 @@ export interface UseNatsResult {
   turnStartedAt: number | null;
   /** Live output-token estimate for the current turn (footer meter readout). */
   liveTokens: number;
+  /**
+   * Currently in-flight `Task` subagent spawns for this session (lead + peer).
+   * Drives the StatusBar agents segment and the subagent overlay.
+   */
+  activeSubagents: SubagentInfo[];
 }
 
 const MAX_MESSAGES = 500;
@@ -109,6 +131,7 @@ export function useNats(sessionName: string): UseNatsResult {
   });
   const [codexWorking, setCodexWorking] = useState(false);
   const [turnStartedAt, setTurnStartedAt] = useState<number | null>(null);
+  const [activeSubagents, setActiveSubagents] = useState<SubagentInfo[]>([]);
   // Live output-token estimate for the footer meter (chars/4), so it ticks up
   // during the turn instead of freezing on the previous turn's terminal total.
   const [liveTokens, setLiveTokens] = useState(0);
@@ -143,6 +166,7 @@ export function useNats(sessionName: string): UseNatsResult {
     setCodexWorking(false);
     setTurnStartedAt(null);
     setLiveTokens(0);
+    setActiveSubagents([]);
     turnOutChars.current = 0;
     codexStreamBuf.current = "";
 
@@ -257,6 +281,17 @@ export function useNats(sessionName: string): UseNatsResult {
         };
         if (t.event === "start" && t.toolId) {
           setCodexWorking(true);
+          if (t.toolName === "Task") {
+            const taskInput = (t.input ?? {}) as Record<string, unknown>;
+            const entry: SubagentInfo = {
+              toolId: t.toolId,
+              source: "codex",
+              subagentType: String(taskInput.subagent_type ?? "agent"),
+              description: String(taskInput.description ?? ""),
+              startedAt: Date.now(),
+            };
+            setActiveSubagents((prev) => [...prev.filter((s) => s.toolId !== entry.toolId), entry]);
+          }
           pushCodex({
             id: `codex-tool-${t.toolId}`,
             type: "tool",
@@ -268,6 +303,7 @@ export function useNats(sessionName: string): UseNatsResult {
             source: "codex",
           });
         } else if (t.event === "end" && t.toolId) {
+          setActiveSubagents((prev) => prev.filter((s) => s.toolId !== t.toolId));
           setMessages((prev) =>
             prev.map((m) =>
               m.type === "tool" && m.toolId === t.toolId && m.source === "codex"
@@ -410,6 +446,18 @@ export function useNats(sessionName: string): UseNatsResult {
               // Also drop "thinking" state so the meter reads "working" during tools.
               setIsTyping(false);
               streamBuf.current = "";
+              if (toolData.toolName === "Task") {
+                const taskInput = (toolData.input ?? {}) as Record<string, unknown>;
+                const startedAt = Date.now();
+                const entry: SubagentInfo = {
+                  toolId: toolData.toolId,
+                  source: "lead",
+                  subagentType: String(taskInput.subagent_type ?? "agent"),
+                  description: String(taskInput.description ?? ""),
+                  startedAt,
+                };
+                setActiveSubagents((prev) => [...prev.filter((s) => s.toolId !== entry.toolId), entry]);
+              }
               const entry: ToolMessage = {
                 id: `tool-${toolData.toolId}`,
                 type: "tool",
@@ -425,6 +473,7 @@ export function useNats(sessionName: string): UseNatsResult {
                 return next.length > MAX_MESSAGES ? next.slice(next.length - MAX_MESSAGES) : next;
               });
             } else if (toolData.event === "end" && toolData.toolId) {
+              setActiveSubagents((prev) => prev.filter((s) => s.toolId !== toolData.toolId));
               setMessages((prev) =>
                 prev.map((m) => {
                   if (m.type === "tool" && m.toolId === toolData.toolId) {
@@ -610,6 +659,7 @@ export function useNats(sessionName: string): UseNatsResult {
     codexWorking,
     turnStartedAt,
     liveTokens,
+    activeSubagents,
   };
 }
 
