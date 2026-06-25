@@ -6,7 +6,7 @@ import { MessageBubble } from "./MessageBubble.js";
 import { TurnGroup } from "./TurnGroup.js";
 import { groupTimeline } from "../lib/group-timeline.js";
 import { THEME } from "../lib/theme.js";
-import type { ChatMessage, TimelineEntry } from "../hooks/useNats.js";
+import type { ChatMessage, PeerReview, TimelineEntry } from "../hooks/useNats.js";
 
 interface ChatViewProps {
   messages: TimelineEntry[];
@@ -16,6 +16,8 @@ interface ChatViewProps {
   leadName?: string;
   /** Display name for the peer (reviewer) participant. */
   peerName?: string;
+  /** Live peer review-gate status, shown on the peer's row of the active turn. */
+  peerReview?: PeerReview | null;
 }
 
 const userBubble = (id: string, content: string): ChatMessage => ({
@@ -41,7 +43,7 @@ const answerBubble = (id: string, content: string, streaming?: boolean): ChatMes
  * (groupTimeline): your prompts and Claude's final answers read inline; all
  * tool runs and the Codex peer collapse into expandable turn groups.
  */
-export function ChatView({ messages, working, leadName, peerName }: ChatViewProps) {
+export function ChatView({ messages, working, leadName, peerName, peerReview }: ChatViewProps) {
   const scrollRef = useRef<ScrollBoxRenderable>(null);
   const nodes = groupTimeline(messages, { working, leadName, peerName });
 
@@ -84,7 +86,7 @@ export function ChatView({ messages, working, leadName, peerName }: ChatViewProp
           ? null
           : nodes.map((node) => {
               if (node.kind === "turn") {
-                return <TurnGroup key={node.id} turn={node} />;
+                return <TurnGroup key={node.id} turn={node} peerReview={peerReview} />;
               }
               if (node.kind === "user") {
                 return <MessageBubble key={node.id} message={userBubble(node.id, node.content)} />;

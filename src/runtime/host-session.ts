@@ -92,6 +92,10 @@ export interface RuntimeHostStreamingSession {
   pendingAbort: boolean;
   /** Agent mode (e.g. "sentinel") - controls compaction announcements and system commands */
   agentMode?: string;
+  /** Fusion converge gate: whether the lead consulted the peer this turn (reset per turn). */
+  convergeConsultedThisTurn?: boolean;
+  /** Fusion converge gate: edits denied this turn — fail-open backstop so the gate can't wedge. */
+  convergeDenyCount?: number;
   /** Session trace run ID for this live runtime process. */
   traceRunId?: string;
   /** Pending message ids yielded to the currently active provider turn. */

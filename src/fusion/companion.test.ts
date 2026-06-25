@@ -47,8 +47,8 @@ describe("ensurePeerCompanion", () => {
   it("persists the consultant brief as systemPromptAppend on create", () => {
     const r = ensurePeerCompanion({ id: "main", cwd: "/tmp/otto-fusion-test" }, "codex", "claude");
     const brief = dbGetAgent(r.agentId)?.systemPromptAppend ?? "";
-    // Hard-anchor on the brief's framing — the peer's identity is "read-only senior reviewer".
-    expect(brief).toContain("READ-ONLY senior reviewer");
+    // Hard-anchor on the brief's framing — the peer's identity is "read-only senior pair".
+    expect(brief).toContain("READ-ONLY senior pair");
     // The lead label (Claude when Codex is the peer) must be rendered into the brief.
     expect(brief).toContain("the lead (Claude)");
   });

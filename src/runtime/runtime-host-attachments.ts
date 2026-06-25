@@ -3,7 +3,7 @@ import { createNatsRemoteSpawn } from "../remote-spawn-nats.js";
 import type { AgentConfig } from "../router/index.js";
 import { createSpecServer } from "../spec/server.js";
 import { createRuntimeHostHooks } from "./host-hooks.js";
-import type { RuntimeMessageTarget } from "./host-session.js";
+import type { RuntimeHostStreamingSession, RuntimeMessageTarget } from "./host-session.js";
 import type { RuntimeCapabilities, RuntimeHookMatcher } from "./types.js";
 
 export interface RuntimeHostAttachmentsOptions {
@@ -13,6 +13,8 @@ export interface RuntimeHostAttachmentsOptions {
   sessionCwd: string;
   resolvedSource?: RuntimeMessageTarget;
   approvalSource?: RuntimeMessageTarget;
+  /** Per-session mutable state threaded to the fusion converge gate hook. */
+  streamingSession?: RuntimeHostStreamingSession;
 }
 
 export interface RuntimeHostAttachments {
@@ -39,6 +41,7 @@ export function buildRuntimeHostAttachments(options: RuntimeHostAttachmentsOptio
     sessionCwd: options.sessionCwd,
     resolvedSource: options.resolvedSource,
     approvalSource: options.approvalSource,
+    streamingSession: options.streamingSession,
   });
 
   return {

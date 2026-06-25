@@ -1,6 +1,7 @@
 /** @jsxImportSource @opentui/react */
 
 import { useCallback, useState } from "react";
+import type { PeerReview } from "../hooks/useNats.js";
 import type { Participant, TurnNode, TurnStep } from "../lib/group-timeline.js";
 import { MARKDOWN_SYNTAX_STYLE } from "../lib/markdown-style.js";
 import { formatTokens } from "../lib/status-meter.js";
@@ -11,10 +12,26 @@ const DIM = THEME.dim;
 
 interface TurnGroupProps {
   turn: TurnNode;
+  /** Live peer review-gate status — shown on the peer's status line while the turn is active. */
+  peerReview?: PeerReview | null;
 }
 
 function partColor(source: string): string {
   return source === "codex" ? THEME.codex : THEME.claude;
+}
+
+/** Maps the peer review-gate state to the peer row's status line. */
+function peerReviewLabel(pr: PeerReview): { text: string; color: string } {
+  switch (pr.state) {
+    case "reviewing":
+      return { text: "revisando…", color: THEME.working };
+    case "approved":
+      return { text: "✓ revisado", color: THEME.done };
+    case "suggested_change":
+      return { text: `✦ ${pr.summary ?? "ajustes"}`, color: THEME.codex };
+    default:
+      return { text: "sem revisão", color: THEME.faint };
+  }
 }
 
 /** Meta suffix: `· 5 tool uses · ~12k tokens`. */
@@ -65,18 +82,30 @@ function StepDetail({ step }: { step: TurnStep }) {
 }
 
 /** One participant row (Claude/Codex) + its status sub-line, expandable to steps. */
-function ParticipantRow({ p, last, working }: { p: Participant; last: boolean; working: boolean }) {
+function ParticipantRow({
+  p,
+  last,
+  working,
+  peerReview,
+}: {
+  p: Participant;
+  last: boolean;
+  working: boolean;
+  peerReview?: PeerReview | null;
+}) {
   // Collapsed by default — the header already shows live activity ("N tool uses
   // · trabalhando"); we do NOT dump every tool step (that floods the screen with
-  // dozens of "shell" lines). Click to expand. (Mouse-off can't click, so open.)
-  const mouseOff = process.env.OTTO_TUI_MOUSE === "0";
+  // dozens of "shell" lines). Click to expand.
   const [override, setOverride] = useState<boolean | null>(null);
-  const open = override ?? mouseOff;
+  const open = override ?? false;
   const [openSteps, setOpenSteps] = useState<Set<string>>(() => new Set());
   const branch = last ? "└" : "├";
   const stem = last ? "    " : "│   ";
-  const status = working ? "trabalhando" : "Done";
-  const statusColor = working ? THEME.working : THEME.done;
+  // The peer's row reflects the live review gate (revisando…/✓ revisado/✦ ajustes)
+  // while the turn is active; otherwise the generic working/Done status.
+  const review = peerReview && p.source === "codex" && working ? peerReviewLabel(peerReview) : null;
+  const status = review ? review.text : working ? "trabalhando" : "Done";
+  const statusColor = review ? review.color : working ? THEME.working : THEME.done;
 
   const toggleStep = useCallback((id: string) => {
     setOpenSteps((prev) => {
@@ -89,7 +118,7 @@ function ParticipantRow({ p, last, working }: { p: Participant; last: boolean; w
 
   return (
     <box flexDirection="column" width="100%">
-      <box width="100%" flexDirection="row" onClick={() => setOverride((v) => !(v ?? mouseOff))}>
+      <box width="100%" flexDirection="row" onClick={() => setOverride((v) => !(v ?? false))}>
         <text content={`  ${branch} `} fg={DIM} />
         <text content={p.name} fg={partColor(p.source)} bold />
         <text content={` · ${partMeta(p)}`} fg={DIM} />
@@ -120,7 +149,7 @@ function ParticipantRow({ p, last, working }: { p: Participant; last: boolean; w
  * with tool-use count, a token estimate, and a status line. Mirrors a
  * multi-agent run; Claude's final answer renders inline below this group.
  */
-export function TurnGroup({ turn }: TurnGroupProps) {
+export function TurnGroup({ turn, peerReview }: TurnGroupProps) {
   const names = turn.participants.map((p) => p.name).join(" + ");
   const status = turn.working ? "trabalhando" : "concluído";
   const dot = turn.working ? THEME.working : THEME.done;
@@ -132,7 +161,13 @@ export function TurnGroup({ turn }: TurnGroupProps) {
         <text content={`${names} · ${status}`} fg={THEME.text} bold />
       </box>
       {turn.participants.map((p, i) => (
-        <ParticipantRow key={p.source} p={p} last={i === turn.participants.length - 1} working={turn.working} />
+        <ParticipantRow
+          key={p.source}
+          p={p}
+          last={i === turn.participants.length - 1}
+          working={turn.working}
+          peerReview={peerReview}
+        />
       ))}
     </box>
   );

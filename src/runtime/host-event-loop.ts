@@ -1381,6 +1381,8 @@ export async function runRuntimeEventLoop(options: RunRuntimeEventLoopOptions): 
         // Reset for next turn
         responseText = "";
         turnTouchedFiles = false;
+        streaming.convergeConsultedThisTurn = false;
+        streaming.convergeDenyCount = 0;
         clearActiveToolState();
         streaming.compacting = false;
         streaming.lastToolFailure = undefined;
@@ -1423,6 +1425,9 @@ export async function runRuntimeEventLoop(options: RunRuntimeEventLoopOptions): 
         });
         streaming.interrupted = true;
         responseText = "";
+        turnTouchedFiles = false;
+        streaming.convergeConsultedThisTurn = false;
+        streaming.convergeDenyCount = 0;
         clearActiveToolState();
         streaming.compacting = false;
         streaming.lastToolFailure = undefined;
@@ -1546,6 +1551,9 @@ export async function runRuntimeEventLoop(options: RunRuntimeEventLoopOptions): 
           source: streaming.currentSource,
         });
 
+        turnTouchedFiles = false;
+        streaming.convergeConsultedThisTurn = false;
+        streaming.convergeDenyCount = 0;
         signalTurnComplete();
       }
     }

@@ -2,6 +2,9 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { requestCascadingApproval, requestPollAnswer, type ApprovalTarget } from "../approval/service.js";
 import { createBashPermissionHook, createToolPermissionHook } from "../bash/index.js";
+import { companionAgentId, companionSessionKey } from "../fusion/companion-id.js";
+import { shouldFuseSession } from "../fusion/policy.js";
+import { getEffectiveFusionState, isFusionDisabled, otherProvider, type FusionProvider } from "../fusion/state.js";
 import { createPreCompactHook } from "../hooks/index.js";
 import { createSanitizeBashHook } from "../hooks/sanitize-bash.js";
 import { nats } from "../nats.js";
@@ -9,6 +12,7 @@ import type { AgentConfig } from "../router/index.js";
 import { getSpecState, isSpecModeActive } from "../spec/server.js";
 import { logger } from "../utils/logger.js";
 import { isGroup } from "../utils/phone.js";
+import type { RuntimeHostStreamingSession } from "./host-session.js";
 import type { RuntimeCapabilities, RuntimeHookMatcher } from "./types.js";
 
 const log = logger.child("runtime:host-hooks");
@@ -33,6 +37,8 @@ export interface RuntimeHostHooksOptions {
   sessionCwd: string;
   resolvedSource?: ApprovalTarget;
   approvalSource?: ApprovalTarget;
+  /** Per-session mutable state, used by the fusion converge gate to track the per-turn consult flag. */
+  streamingSession?: RuntimeHostStreamingSession;
 }
 
 export function createRuntimeHostHooks({
@@ -42,6 +48,7 @@ export function createRuntimeHostHooks({
   sessionCwd,
   resolvedSource,
   approvalSource,
+  streamingSession,
 }: RuntimeHostHooksOptions): Record<string, RuntimeHookMatcher[]> {
   if (!runtimeCapabilities.supportsHostSessionHooks) {
     return {};
@@ -83,6 +90,7 @@ export function createRuntimeHostHooks({
 
   hooks.PreToolUse = [
     ...(hooks.PreToolUse ?? []),
+    ...(streamingSession ? [{ hooks: [createConvergeGateHook({ sessionName, agent, streamingSession })] }] : []),
     { hooks: [createSpecBlockHook(sessionName)] },
     {
       matcher: "mcp__spec__exit_spec_mode",
@@ -104,6 +112,80 @@ export function createRuntimeHostHooks({
   });
 
   return hooks;
+}
+
+/** Edit tools the converge gate blocks until the lead has consulted the peer. NOT Bash —
+ * the lead needs Bash to run the consult itself (and git/tests). */
+const CONVERGE_GATE_EDIT_TOOLS = new Set([
+  "Edit",
+  "Write",
+  "MultiEdit",
+  "NotebookEdit",
+  "apply_patch",
+  "str_replace_editor",
+]);
+/** Fail open after this many denies so a model that refuses to consult can't wedge the turn. */
+const CONVERGE_GATE_MAX_DENIES = 3;
+
+/**
+ * Fusion converge gate: in continuous pairing the lead must align the approach
+ * with the peer BEFORE writing code. This PreToolUse hook blocks file-mutating
+ * EDIT tools until the lead has run a blocking peer consult
+ * (`otto sessions send <companion> ... -w`) this turn. It records that consult
+ * (a Bash call) and never blocks Bash. Skips entirely when fusion is off, the
+ * peer is exhausted, the session is sentinel, or it isn't a fused session — and
+ * fails open after a few denies so it can never wedge the lead.
+ */
+function createConvergeGateHook(options: {
+  sessionName: string;
+  agent: AgentConfig;
+  streamingSession: RuntimeHostStreamingSession;
+}) {
+  const { sessionName, agent, streamingSession } = options;
+  const companionKey = companionSessionKey(companionAgentId(agent.id));
+  return async (input: any) => {
+    const toolName = input?.tool_name as string | undefined;
+    if (!toolName) return {};
+
+    // Record the converge consult itself and always let Bash through.
+    if (toolName === "Bash") {
+      const command = (input?.tool_input?.command as string) ?? "";
+      const isConsult =
+        /\botto\s+sessions\s+send\b/.test(command) &&
+        /(^|\s)(-w|--wait)(\s|$)/.test(command) &&
+        command.includes(companionKey);
+      if (isConsult) streamingSession.convergeConsultedThisTurn = true;
+      return {};
+    }
+
+    if (!CONVERGE_GATE_EDIT_TOOLS.has(toolName)) return {};
+    if (streamingSession.convergeConsultedThisTurn) return {};
+    if (streamingSession.agentMode === "sentinel") return {};
+    if (!shouldFuseSession({ sessionName, agentId: agent.id })) return {};
+    if (isFusionDisabled(agent.id)) return {};
+
+    // If the peer is out of quota the lead works solo — don't block edits.
+    const principal: FusionProvider = agent.provider === "codex" ? "codex" : "claude";
+    const peer = otherProvider(principal);
+    const fusionState = getEffectiveFusionState(agent.id, principal);
+    const peerExhausted = peer === "codex" ? fusionState.codexExhausted : fusionState.claudeExhausted;
+    if (peerExhausted) return {};
+
+    if ((streamingSession.convergeDenyCount ?? 0) >= CONVERGE_GATE_MAX_DENIES) return {};
+    streamingSession.convergeDenyCount = (streamingSession.convergeDenyCount ?? 0) + 1;
+
+    const peerName = peer === "codex" ? "Codex" : "Claude";
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse" as const,
+        permissionDecision: "deny" as const,
+        permissionDecisionReason:
+          `Pareamento Fusion: alinhe a abordagem com ${peerName} ANTES de editar. ` +
+          `Rode \`otto sessions send ${companionKey} "<sua abordagem + arquivos/área a checar>" -w\`, ` +
+          `convirja com ele, e então implemente. (Você só edita depois de consultar o peer neste turn.)`,
+      },
+    };
+  };
 }
 
 function createSpecBlockHook(sessionName: string) {

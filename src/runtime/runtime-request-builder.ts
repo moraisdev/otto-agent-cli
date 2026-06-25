@@ -182,6 +182,7 @@ export async function buildRuntimeStartRequest(
     sessionCwd,
     resolvedSource,
     approvalSource,
+    streamingSession,
   });
   const { text: systemPromptAppend, sections: systemPromptSections } = await buildRuntimeSystemPrompt({
     agent,

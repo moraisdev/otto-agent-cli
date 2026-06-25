@@ -25,8 +25,12 @@ export const FUSION_REVIEW_TIMEOUT_MS = Math.max(
   Number(process.env.OTTO_FUSION_REVIEW_TIMEOUT_MS) || 5 * 60 * 1000,
 );
 
-/** Max review passes per turn (draft + up to N-1 revisions) before shipping. */
-export const FUSION_REVIEW_MAX_ROUNDS = Math.max(1, Number(process.env.OTTO_FUSION_REVIEW_MAX_ROUNDS) || 2);
+/**
+ * Max review passes per turn (draft + up to N-1 revisions) before shipping. The
+ * loop runs peer-review → lead-revise → re-review until the peer approves, capped
+ * here so a stubborn disagreement can't wedge the turn forever.
+ */
+export const FUSION_REVIEW_MAX_ROUNDS = Math.max(1, Number(process.env.OTTO_FUSION_REVIEW_MAX_ROUNDS) || 4);
 
 export type FusionReviewOutcome = "approved" | "changes" | "unavailable";
 

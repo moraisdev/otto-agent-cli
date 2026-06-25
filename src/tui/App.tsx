@@ -106,7 +106,6 @@ export function App() {
     stopWorking,
     totalTokens,
     runtimeInfo,
-    codexWorking,
     turnStartedAt,
     liveTokens,
     activeSubagents,
@@ -527,6 +526,7 @@ export function App() {
           working={isWorking}
           leadName={providerName(principalProvider)}
           peerName={providerName(peerProvider)}
+          peerReview={peerReview}
         />
       )}
 
@@ -571,7 +571,6 @@ export function App() {
         isTyping={isTyping}
         isCompacting={isCompacting}
         totalTokens={totalTokens}
-        codexWorking={codexWorking}
         fusionEnabled={fusionEnabled}
         companionProvider={fusionEnabled ? peerProvider : null}
         companionModel={fusionEnabled ? peerModel : null}
@@ -579,7 +578,6 @@ export function App() {
         remoteLabel={remoteLabel}
         remoteConnected={remoteConnected}
         activeSubagentsCount={activeSubagents.length}
-        peerReview={peerReview}
         onModelClick={() => setModelPickerOpen(true)}
         onFusionClick={toggleFusion}
         onRemoteClick={() => setChannelMenuOpen(true)}

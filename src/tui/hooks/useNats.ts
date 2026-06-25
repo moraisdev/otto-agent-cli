@@ -81,8 +81,6 @@ export interface UseNatsResult {
   stopWorking: () => void;
   totalTokens: TokenUsage;
   runtimeInfo: RuntimeDisplayInfo;
-  /** True while the Codex (GPT-5.5) peer is actively producing output. */
-  codexWorking: boolean;
   /** Epoch ms when the current turn started; null when idle (for the footer clock). */
   turnStartedAt: number | null;
   /** Live output-token estimate for the current turn (footer meter readout). */
@@ -142,7 +140,6 @@ export function useNats(sessionName: string): UseNatsResult {
     provider: null,
     executionModel: null,
   });
-  const [codexWorking, setCodexWorking] = useState(false);
   const [turnStartedAt, setTurnStartedAt] = useState<number | null>(null);
   const [activeSubagents, setActiveSubagents] = useState<SubagentInfo[]>([]);
   const [peerReview, setPeerReview] = useState<PeerReview | null>(null);
@@ -178,7 +175,6 @@ export function useNats(sessionName: string): UseNatsResult {
     setIsWorking(false);
     setTotalTokens({ input: 0, output: 0, cacheRead: 0, cacheCreation: 0, contextTokens: 0 });
     setRuntimeInfo({ provider: null, executionModel: null });
-    setCodexWorking(false);
     setTurnStartedAt(null);
     setLiveTokens(0);
     setActiveSubagents([]);
@@ -235,7 +231,6 @@ export function useNats(sessionName: string): UseNatsResult {
         if (!chunk) return;
         codexStreamBuf.current += chunk;
         turnOutChars.current += chunk.length;
-        setCodexWorking(true);
         if (codexStreamFlush.current === null) {
           codexStreamFlush.current = createThrottledFlush(() => {
             const text = codexStreamBuf.current;
@@ -267,7 +262,6 @@ export function useNats(sessionName: string): UseNatsResult {
         const response = (data as { response?: string }).response;
         codexStreamFlush.current?.cancel();
         codexStreamBuf.current = "";
-        setCodexWorking(false);
         if (!response) {
           setMessages((prev) => prev.filter((m) => m.id !== CODEX_STREAMING_ID));
           return;
@@ -296,7 +290,6 @@ export function useNats(sessionName: string): UseNatsResult {
           durationMs?: number;
         };
         if (t.event === "start" && t.toolId) {
-          setCodexWorking(true);
           if (t.toolName === "Task") {
             const taskInput = (t.input ?? {}) as Record<string, unknown>;
             const entry: SubagentInfo = {
@@ -330,12 +323,9 @@ export function useNats(sessionName: string): UseNatsResult {
         }
       } else if (topic === codexRuntimeTopic) {
         const r = data as { type?: string };
-        if (r.type === "assistant" || r.type === "assistant.message") {
-          setCodexWorking(true);
-        } else if (isTerminalRuntimeEvent(r.type)) {
+        if (isTerminalRuntimeEvent(r.type)) {
           codexStreamFlush.current?.cancel();
           codexStreamBuf.current = "";
-          setCodexWorking(false);
           setMessages((prev) => prev.filter((m) => m.id !== CODEX_STREAMING_ID));
         }
       }
@@ -686,7 +676,6 @@ export function useNats(sessionName: string): UseNatsResult {
     stopWorking,
     totalTokens,
     runtimeInfo,
-    codexWorking,
     turnStartedAt,
     liveTokens,
     activeSubagents,
