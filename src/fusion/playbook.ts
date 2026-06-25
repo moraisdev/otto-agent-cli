@@ -63,6 +63,10 @@ export function buildFusionLeadPlaybook(input: {
     `Talk to it like a peer senior: weigh its advice, push back when you disagree — then implement. Consulting`,
     `it is also what makes the pairing visible to the user, so lean on it.`,
     ``,
+    `If you edit several files in a row without checking in with ${peerName}, the runtime will inject a`,
+    `\`[System] Inform\` reminder. Treat it as a signal that the streak is real and consult before the next`,
+    `edit — don't push past it.`,
+    ``,
     `When done, reply ONCE to the user: what you built, the key insights/decisions ${peerName} contributed,`,
     `and any disagreement you resolved.`,
   ].join("\n");
