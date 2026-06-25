@@ -103,7 +103,10 @@ import type {
   SessionTurnRecord,
 } from "../../session-trace/types.js";
 
-const SEND_TIMEOUT_MS = 120000; // 2 minutes
+const SEND_TIMEOUT_MS = 120000; // 2 minutes — default wait when --timeout is omitted
+// Largest value setTimeout accepts (~24.8 days). `--timeout 0` maps here to mean
+// "wait as long as it takes" — used by the fusion review gate's blocking consult.
+const MAX_WAIT_TIMEOUT_MS = 2_147_483_647;
 const CONFIG_DB_META = { source: "config-db", freshness: "persisted", via: "router-config" } as const;
 const SESSION_DB_META = { source: "session-db", freshness: "persisted" } as const;
 const RUNTIME_SNAPSHOT_META = { source: "runtime-snapshot", freshness: "persisted" } as const;
@@ -2468,13 +2471,23 @@ export class SessionCommands {
     @Option({ flags: "--thread-scope <type:id>", description: "Scope for thread lookup/create" }) threadScope?: string,
     @Option({ flags: "--thread-owner <type:id>", description: "Owner for thread auto-create" }) threadOwner?: string,
     @Option({ flags: "--barrier <barrier>", description: "Delivery barrier: p0|p1|p2|p3" }) barrier?: string,
-    @Option({ flags: "--timeout <seconds>", description: "Max seconds to wait for the reply with -w (default: 120)" })
+    @Option({
+      flags: "--timeout <seconds>",
+      description: "Max seconds to wait for the reply with -w (default: 120, 0 = no limit)",
+    })
     waitTimeout?: string,
     @Option({ flags: "--json", description: "Print raw JSON result" }) asJson?: boolean,
   ) {
-    const waitTimeoutMs = waitTimeout
-      ? Math.max(1, Number.parseInt(waitTimeout, 10) || 0) * 1000 || undefined
-      : undefined;
+    // Parse --timeout robustly: a non-numeric value falls back to the default
+    // (undefined → SEND_TIMEOUT_MS downstream); an explicit 0/negative means
+    // "no limit" instead of silently collapsing to the 120s default.
+    const waitTimeoutMs = ((): number | undefined => {
+      if (waitTimeout === undefined) return undefined;
+      const parsed = Number.parseInt(waitTimeout, 10);
+      if (!Number.isFinite(parsed)) return undefined;
+      if (parsed <= 0) return MAX_WAIT_TIMEOUT_MS;
+      return parsed * 1000;
+    })();
     let createdSession = false;
     const session = this.resolveTarget(nameOrKey, agentId, {
       silent: Boolean(asJson),
