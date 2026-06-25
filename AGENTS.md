@@ -99,13 +99,19 @@ It fires automatically from every interactive entry point — WhatsApp/omni
 (`obs:*`) sessions, isolated automation (`:cron:` / `:trigger:`) sessions, and non-Claude-led
 agents (see `src/fusion/policy.ts`).
 
-What happens each normal turn (all on Otto primitives — agents, REBAC, sessions, observers):
-1. A read-only Codex companion (`codex-companion-<leadId>`, `provider: codex`, same cwd) is
-   ensured and granted a read-only tool set; warmed once with a consultant brief.
-2. An Observation-Plane rule (`fusion-obs-<leadId>`, `report`/`debounce`) is registered so
-   Codex reviews Claude's completed turns and can proactively `otto sessions inform`.
-3. The lead turn is prefixed with the fusion playbook; Claude implements and may consult the
-   companion synchronously: `otto sessions send agent:codex-companion-<leadId>:main "..." -w`.
+What happens each normal turn (all on Otto primitives — agents, REBAC, sessions, observers).
+The model is **async-first**: the lead works at solo speed and the peer reviews concurrently —
+it is NOT on the lead's critical path.
+1. A read-only peer companion (`peer-companion-<leadId>`, the non-principal provider, same cwd)
+   is ensured and granted a read-only tool set; its consultant brief is persisted as the agent's
+   `systemPromptAppend`.
+2. An Observation-Plane rule (`fusion-obs-<leadId>`, `report`/`debounce` ~15s) is registered so the
+   peer reviews the lead's completed turns in the background and proactively `otto sessions inform`s
+   findings — the PRIMARY (async) feedback channel.
+3. The lead turn is prefixed with the fusion playbook; the lead implements at full speed and folds in
+   the peer's async informs on the next turn. Only occasionally (a hard fork) does it issue a lean
+   synchronous consult `otto sessions send agent:peer-companion-<leadId>:main "..." -w` — the
+   exception, not the default.
 
 ### Failover (provider quota)
 
