@@ -21,20 +21,35 @@ export interface ModelPickerProps {
   agentId: string;
   currentProvider: RuntimeProviderId;
   currentModel: string | null;
+  /** Per-provider quota exhaustion (epoch-ms until; 0 = available). */
+  quotaUntil?: { claude: number; codex: number };
   onApply: (selection: ModelPickerSelection) => void;
   onClose: () => void;
 }
 
-export function ModelPicker({ agentId, currentProvider, currentModel, onApply, onClose }: ModelPickerProps) {
+export function ModelPicker({
+  agentId,
+  currentProvider,
+  currentModel,
+  quotaUntil,
+  onApply,
+  onClose,
+}: ModelPickerProps) {
   const renderer = useRenderer();
   const providerOptions = useMemo(
     () =>
-      listRuntimeProviders().map((option) => ({
-        name: option.name,
-        description: option.description,
-        value: option.id,
-      })),
-    [],
+      listRuntimeProviders().map((option) => {
+        const until = (option.id === "codex" ? quotaUntil?.codex : quotaUntil?.claude) ?? 0;
+        const exhausted = until > Date.now();
+        return {
+          name: exhausted ? `${option.name}  ⚠ sem cota` : option.name,
+          description: exhausted
+            ? `Out of quota — fusion uses the other model until it resets. ${option.description}`
+            : option.description,
+          value: option.id,
+        };
+      }),
+    [quotaUntil],
   );
 
   const initialProviderIndex = Math.max(

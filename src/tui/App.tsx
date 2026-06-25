@@ -28,7 +28,13 @@ import { THEME } from "./lib/theme.js";
 import { resolveRuntimeDisplayLabel } from "./hooks/runtime-display.js";
 import { applyAgentRuntimeSelection } from "./runtime-config.js";
 import { peerModelFor } from "../fusion/companion.js";
-import { type FusionProvider, isFusionDisabled, otherProvider, setFusionDisabled } from "../fusion/state.js";
+import {
+  dbGetFusionState,
+  type FusionProvider,
+  isFusionDisabled,
+  otherProvider,
+  setFusionDisabled,
+} from "../fusion/state.js";
 import { publish, subscribe } from "../nats.js";
 import { resetSession } from "../router/sessions.js";
 
@@ -119,6 +125,12 @@ export function App() {
 
   // Fusion on/off for this session's agent.
   const [fusionEnabled, setFusionEnabled] = useState(true);
+  // Per-provider quota exhaustion (epoch-ms until; 0 = available). Drives the
+  // "out of quota" treatment in the status bar + model picker.
+  const [exhaustion, setExhaustion] = useState<{ claudeUntil: number; codexUntil: number }>({
+    claudeUntil: 0,
+    codexUntil: 0,
+  });
   const [channelMenuOpen, setChannelMenuOpen] = useState(false);
   const [subagentOverlayOpen, setSubagentOverlayOpen] = useState(false);
   // Status-bar keyboard focus: null = input focused; 0=model, 1=fusion, 2=remote.
@@ -127,14 +139,19 @@ export function App() {
     const refresh = () => {
       try {
         setFusionEnabled(!isFusionDisabled(agentId));
+        const fs = dbGetFusionState(agentId);
+        setExhaustion({ claudeUntil: fs.claudeExhaustedUntil, codexUntil: fs.codexExhaustedUntil });
       } catch {
         /* db not ready */
       }
     };
     refresh();
+    // Re-read periodically so a quota that expired (TTL) clears in the UI without
+    // an explicit event (exhaustion is cleared by a successful turn or by timeout).
+    const tick = setInterval(refresh, 20_000);
     let stopped = false;
     (async () => {
-      for await (const evt of subscribe("otto.config.changed")) {
+      for await (const evt of subscribe("otto.config.changed", "otto.fusion.limit.>")) {
         void evt;
         if (stopped) break;
         refresh();
@@ -142,6 +159,7 @@ export function App() {
     })().catch(() => {});
     return () => {
       stopped = true;
+      clearInterval(tick);
     };
   }, [agentId]);
 
@@ -479,6 +497,9 @@ export function App() {
   const peerModel = peerModelFor(peerProvider);
   // Principal model, plus the peer's model when fusion is on.
   const meterModels = runtimeLabel.model + (fusionEnabled ? ` + ${peerModel}` : "");
+  // Is the peer out of quota right now? (drives the degraded "sem cota" treatment)
+  const exhaustionUntilFor = (p: FusionProvider) => (p === "codex" ? exhaustion.codexUntil : exhaustion.claudeUntil);
+  const peerExhausted = exhaustionUntilFor(peerProvider) > Date.now();
 
   // `otto --resume`: show the conversation picker before the chat. Picking
   // switches the live session; Esc keeps the current (main) session.
@@ -554,6 +575,7 @@ export function App() {
         fusionEnabled={fusionEnabled}
         companionProvider={fusionEnabled ? peerProvider : null}
         companionModel={fusionEnabled ? peerModel : null}
+        peerExhausted={peerExhausted}
         remoteLabel={remoteLabel}
         remoteConnected={remoteConnected}
         activeSubagentsCount={activeSubagents.length}
@@ -585,6 +607,7 @@ export function App() {
             agentId={agent.id}
             currentProvider={agent.provider ?? "claude"}
             currentModel={currentSession.modelOverride ?? agent.model ?? null}
+            quotaUntil={{ claude: exhaustion.claudeUntil, codex: exhaustion.codexUntil }}
             onClose={() => setModelPickerOpen(false)}
             onApply={({ provider, model }) => {
               void (async () => {

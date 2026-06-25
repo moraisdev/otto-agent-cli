@@ -20,6 +20,8 @@ export interface StatusBarProps {
   companionProvider?: string | null;
   /** Peer model running alongside the principal (shown only when fusion is on). */
   companionModel?: string | null;
+  /** True when the peer provider is out of quota — shown degraded ("sem cota"). */
+  peerExhausted?: boolean;
   /** Connected remote channel(s) label, e.g. "remoto" | "whatsapp" | "2 canais". */
   remoteLabel?: string;
   /** Whether any remote channel is connected (drives the ● + color). */
@@ -67,6 +69,7 @@ export function StatusBar({
   fusionEnabled = true,
   companionProvider,
   companionModel,
+  peerExhausted = false,
   remoteLabel = "remoto",
   remoteConnected = false,
   activeSubagentsCount = 0,
@@ -103,7 +106,13 @@ export function StatusBar({
         <box flexDirection="row" onClick={onModelClick} bg={focusBg(0)} flexShrink={0}>
           <text content={`${runtimeLabel.provider}/${runtimeLabel.model}`} fg={focusFg(0, GOLD)} bg={focusBg(0)} />
           {fusionEnabled && companionModel ? (
-            <text content={` + ${peerProvider}/${companionModel}`} fg={focusFg(0, peerColor)} bg={focusBg(0)} />
+            peerExhausted ? (
+              // Peer out of quota: show it dimmed with a marker so the pairing
+              // doesn't look active when it can't actually run.
+              <text content={` + ${peerProvider} (sem cota)`} fg={focusFg(0, THEME.faint)} bg={focusBg(0)} />
+            ) : (
+              <text content={` + ${peerProvider}/${companionModel}`} fg={focusFg(0, peerColor)} bg={focusBg(0)} />
+            )
           ) : null}
         </box>
         <box flexGrow={1} bg={BG} />
