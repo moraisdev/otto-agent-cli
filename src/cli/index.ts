@@ -42,6 +42,19 @@ if (isRootVersionRequest(process.argv.slice(2))) {
   process.exit(0);
 }
 
+/**
+ * A unique, NATS-safe session name for a fresh terminal session. Bare `otto`
+ * opens one of these (empty, no history) every launch; `otto --resume` lists the
+ * past ones that actually have a conversation. Single token (no dots/whitespace)
+ * so it is a valid `otto.session.<name>.*` subject.
+ */
+function freshTuiSessionName(): string {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  return `tui-${stamp}-${Math.random().toString(36).slice(2, 5)}`;
+}
+
 program
   .name("otto")
   .description("Otto Bot CLI - Claude-powered bot management")
@@ -108,19 +121,20 @@ program
 // TUI - full-screen terminal interface
 program
   .command("tui")
-  .description("Open the terminal UI for a session")
-  .argument("[session]", "Session name or key", "main")
-  .action(async (session: string) => {
+  .description("Open the terminal UI for a session (no name = a fresh empty session)")
+  .argument("[session]", "Session name or key (omit for a fresh empty session)")
+  .action(async (session: string | undefined) => {
+    const target = session ?? freshTuiSessionName();
     await runWithCliAudit(
       {
         group: "_root",
         name: "tui",
         tool: "root_tui",
-        input: { session },
+        input: { session: target },
         closeLazyConnection: true,
       },
       async () => {
-        await spawnDirectTui(session, projectRoot);
+        await spawnDirectTui(target, projectRoot);
       },
     );
   });
@@ -182,8 +196,9 @@ program.action(async () => {
   }
   const { ensureDaemonReady } = await import("./auto-launch.js");
   await ensureDaemonReady(projectRoot);
-  // `otto --resume` opens the session picker first (TUI reads this sentinel).
-  await spawnDirectTui(program.opts().resume ? "--resume" : "main", projectRoot);
+  // Bare `otto` opens a fresh, empty session every launch; `otto --resume` opens
+  // the picker (sentinel the TUI reads) to return to a past conversation.
+  await spawnDirectTui(program.opts().resume ? "--resume" : freshTuiSessionName(), projectRoot);
 });
 
 // Parse and execute

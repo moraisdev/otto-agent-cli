@@ -61,11 +61,16 @@ export function loadRecentSessions(limit = 25): RecentSession[] {
   for (const s of listSessions()) {
     const name = s.name ?? s.sessionKey;
     if (!isUserFacingSession(name)) continue;
+    // `--resume` returns to a CONVERSATION, so skip sessions with no messages —
+    // e.g. fresh `tui-*` sessions opened (bare `otto`) but never used. Real work
+    // (any message) stays listed and resumable.
+    const preview = previewOf(name);
+    if (!preview) continue;
     out.push({
       sessionName: name,
       label: sessionLabel(s),
       agentId: s.agentId,
-      preview: previewOf(name),
+      preview,
       updatedAt: s.updatedAt,
     });
     if (out.length >= limit) break;
