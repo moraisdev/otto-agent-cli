@@ -43,16 +43,14 @@ if (isRootVersionRequest(process.argv.slice(2))) {
 }
 
 /**
- * A unique, NATS-safe session name for a fresh terminal session. Bare `otto`
- * opens one of these (empty, no history) every launch; `otto --resume` lists the
- * past ones that actually have a conversation. Single token (no dots/whitespace)
- * so it is a valid `otto.session.<name>.*` subject.
+ * A short, unique, NATS-safe session name for a fresh terminal session. Bare
+ * `otto` opens one of these (empty, no history) every launch; `otto --resume`
+ * lists the past ones that actually have a conversation. Kept short (e.g.
+ * `tui-k3f9a`) so it reads cleanly in the status bar; single token (no
+ * dots/whitespace) so it is a valid `otto.session.<name>.*` subject.
  */
 function freshTuiSessionName(): string {
-  const d = new Date();
-  const pad = (n: number) => String(n).padStart(2, "0");
-  const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-  return `tui-${stamp}-${Math.random().toString(36).slice(2, 5)}`;
+  return `tui-${Math.random().toString(36).slice(2, 7)}`;
 }
 
 program
